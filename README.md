@@ -1,59 +1,59 @@
 # SockRoute
 
-SockRoute is a small OpenWrt service for manually routing selected LAN clients through a chosen SOCKS outbound without restarting the main proxy stack.
+SockRoute - это веб-сервис для LuCI на OpenWrt, который позволяет вручную отправлять выбранных LAN-клиентов в выбранный SOCKS outbound без перезапуска основного прокси-стека.
 
-It provides:
+Проект устанавливает:
 
-- a separate transparent `sing-box` instance;
-- nftables set based client switching;
-- a LuCI page under `Services -> SockRoute`;
-- a local HTTP API for Home Assistant or other LAN automation;
-- named SOCKS outbound profiles;
-- live nft counters for routed clients.
+- LuCI-страницу `Сервисы -> SockRoute`;
+- отдельный прозрачный `sing-box`;
+- nftables set для быстрого включения и выключения клиентов;
+- локальный HTTP API для Home Assistant и других LAN-интеграций;
+- именованные SOCKS outbound профили;
+- живые счётчики nft для клиентов, которые реально попали в SockRoute.
 
-## Quick Install
+## Быстрая установка
 
-Run on the OpenWrt router:
+Запуск на OpenWrt:
 
 ```sh
 wget -O /tmp/sockroute-install.sh https://raw.githubusercontent.com/Kemper51rus/SockRoute/main/install.sh
 sh /tmp/sockroute-install.sh
 ```
 
-Short form:
+Короткий вариант:
 
 ```sh
 wget -O - https://raw.githubusercontent.com/Kemper51rus/SockRoute/main/install.sh | sh
 ```
 
-The installer:
+Установщик:
 
-- installs required packages with `apk` or `opkg`;
-- backs up existing SockRoute files to `/root/sockroute-backups/<timestamp>`;
-- installs service, API and LuCI files;
-- creates `/etc/config/sockroute` and `/etc/config/sockroute_api` if they do not exist;
-- detects `passwall2` hooks when available, otherwise uses standard `fw4` hooks;
-- enables and starts `/etc/init.d/sockroute`;
-- clears LuCI caches and restarts `rpcd`/`uhttpd`.
+- ставит нужные пакеты через `apk` или `opkg`;
+- делает бэкап существующих файлов SockRoute в `/root/sockroute-backups/<timestamp>`;
+- устанавливает службу, API и LuCI-файлы;
+- создаёт `/etc/config/sockroute` и `/etc/config/sockroute_api`, если их ещё нет;
+- использует hook-цепочки PassWall2, если они есть, иначе подключается к стандартным цепочкам `fw4`;
+- включает и запускает `/etc/init.d/sockroute`;
+- чистит LuCI cache и перезапускает `rpcd`/`uhttpd`.
 
-## Requirements
+## Требования
 
-- OpenWrt with nftables/firewall4.
+- OpenWrt с nftables/firewall4.
 - `sing-box`.
-- A reachable SOCKS5 endpoint. It can be local, for example `127.0.0.1:1080`, or on another LAN host.
-- Existing nft hook chains:
-  - preferred: `inet passwall2 PSW2_NAT` and `inet passwall2 PSW2_MANGLE`;
-  - fallback: `inet fw4 dstnat` and `inet fw4 mangle_prerouting`.
+- Доступный SOCKS5 endpoint. Он может быть локальным, например `127.0.0.1:1080`, или находиться на другом устройстве в LAN.
+- nft hook-цепочки:
+  - предпочтительно: `inet passwall2 PSW2_NAT` и `inet passwall2 PSW2_MANGLE`;
+  - запасной вариант: `inet fw4 dstnat` и `inet fw4 mangle_prerouting`.
 
-## Configure
+## Настройка
 
-Open LuCI:
+Откройте LuCI:
 
 ```text
-Services -> SockRoute
+Сервисы -> SockRoute
 ```
 
-Or use CLI:
+Или используйте CLI:
 
 ```sh
 /usr/libexec/sockroute socks-list
@@ -61,19 +61,19 @@ Or use CLI:
 /etc/init.d/sockroute restart
 ```
 
-Add a client:
+Добавить клиента:
 
 ```sh
-/usr/libexec/sockroute add-named 192.168.1.100 "Client"
+/usr/libexec/sockroute add-named 192.168.1.100 "Клиент"
 ```
 
-Remove a client from runtime routing:
+Выключить маршрутизацию клиента через SockRoute:
 
 ```sh
 /usr/libexec/sockroute del 192.168.1.100
 ```
 
-Delete a client from the saved profile:
+Удалить клиента из сохранённого профиля:
 
 ```sh
 /usr/libexec/sockroute delete-client 192.168.1.100
@@ -81,20 +81,20 @@ Delete a client from the saved profile:
 
 ## HTTP API
 
-Default endpoint:
+Endpoint по умолчанию:
 
 ```text
 http://192.168.1.1/cgi-bin/sockroute-api?ip=192.168.1.100&action=status
 ```
 
-Actions:
+Действия:
 
-- `status`
-- `on`
-- `off`
-- `toggle`
+- `status`;
+- `on`;
+- `off`;
+- `toggle`.
 
-Optional outbound override:
+Опциональный выбор outbound:
 
 ```text
 http://192.168.1.1/cgi-bin/sockroute-api?ip=192.168.1.100&action=on&outbound=Tor
@@ -102,7 +102,7 @@ http://192.168.1.1/cgi-bin/sockroute-api?ip=192.168.1.100&action=on&outbound=192
 http://192.168.1.1/cgi-bin/sockroute-api?ip=192.168.1.100&action=on&outbound=default
 ```
 
-API access is restricted by `/etc/config/sockroute_api`:
+Доступ к API ограничивается в `/etc/config/sockroute_api`:
 
 ```sh
 uci add_list sockroute_api.main.allowed_source_ip='192.168.1.2'
@@ -110,18 +110,18 @@ uci set sockroute_api.main.allowed_target_cidr='192.168.1.0/24'
 uci commit sockroute_api
 ```
 
-If `sockroute_api.main.token` is set, pass it as `token=...` or `X-SockRoute-Token`.
+Если задан `sockroute_api.main.token`, передавайте его как `token=...` или HTTP-заголовок `X-SockRoute-Token`.
 
 ## Home Assistant
 
-The LuCI page generates `command_line` YAML for current clients.
+LuCI-страница генерирует `command_line` YAML по текущему списку клиентов.
 
-Example:
+Пример:
 
 ```yaml
 command_line:
   - switch:
-      name: "Client SockRoute"
+      name: "Клиент SockRoute"
       unique_id: sockroute_client
       command_state: >-
         curl -fsS --max-time 10 "http://192.168.1.1/cgi-bin/sockroute-api?ip=192.168.1.100&action=status"
@@ -132,14 +132,14 @@ command_line:
         curl -fsS --max-time 15 "http://192.168.1.1/cgi-bin/sockroute-api?ip=192.168.1.100&action=off"
 ```
 
-After changing `configuration.yaml`, run:
+После изменения `configuration.yaml`:
 
 ```sh
 ha core check
 ha core restart
 ```
 
-## Diagnostics
+## Диагностика
 
 ```sh
 /etc/init.d/sockroute status
@@ -151,7 +151,7 @@ logread -e sockroute
 logread -e sockroute-api
 ```
 
-## Uninstall
+## Удаление
 
 ```sh
 /etc/init.d/sockroute stop
@@ -163,13 +163,12 @@ rm -f /usr/share/rpcd/acl.d/luci-app-sockroute.json
 rm -f /www/luci-static/resources/view/sockroute.js
 ```
 
-Configs are intentionally not removed by the command above:
+Конфиги специально не удаляются командами выше. Если нужно удалить и их:
 
 ```sh
 rm -f /etc/config/sockroute /etc/config/sockroute_api
 ```
 
-## Details
+## Подробности
 
-See [docs/reference.md](docs/reference.md).
-
+Подробное описание схемы, LuCI, API, SOCKS outbound и диагностики: [docs/reference.md](docs/reference.md).

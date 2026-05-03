@@ -1,0 +1,20 @@
+{
+	"luci-app-sockroute": {
+		"description": "Grant access to SockRoute controls",
+		"read": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/libexec/sockroute": [ "exec" ],
+				"/etc/init.d/sockroute": [ "exec" ]
+			},
+			"uci": [ "sockroute", "sockroute_api" ]
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/sockroute": [ "exec" ],
+				"/etc/init.d/sockroute": [ "exec" ]
+			},
+			"uci": [ "sockroute", "sockroute_api" ]
+		}
+	}
+}

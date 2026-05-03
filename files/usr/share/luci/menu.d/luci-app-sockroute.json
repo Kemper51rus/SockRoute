@@ -1,0 +1,18 @@
+{
+	"admin/services/sockroute": {
+		"title": "SockRoute",
+		"order": 93,
+		"action": {
+			"type": "view",
+			"path": "sockroute"
+		},
+		"depends": {
+			"acl": [ "luci-app-sockroute" ],
+			"fs": {
+				"/usr/libexec/sockroute": "executable",
+				"/etc/init.d/sockroute": "executable"
+			},
+			"uci": { "sockroute": true }
+		}
+	}
+}

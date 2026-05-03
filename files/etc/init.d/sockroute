@@ -1,0 +1,135 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+HELPER="/usr/libexec/sockroute"
+CONFIG="sockroute"
+SECTION="main"
+
+cfg() {
+	key="$1"
+	default="$2"
+	uci -q get "$CONFIG.$SECTION.$key" 2>/dev/null || printf '%s' "$default"
+}
+
+enabled() {
+	case "$(cfg enabled 1)" in
+		0|no|false|off) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+start_service() {
+	enabled || return 0
+	[ -x "$HELPER" ] || return 1
+
+	bin="$(cfg sing_box_bin /usr/bin/sing-box)"
+	config_file="$(cfg sing_box_config /etc/sockroute/sing-box.json)"
+	[ -x "$bin" ] || return 1
+
+	"$HELPER" write-config
+	"$bin" check -c "$config_file" >/dev/null || return 1
+	"$HELPER" setup || return 1
+
+	procd_open_instance
+	procd_set_param command "$bin" run -c "$config_file"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	[ -x "$HELPER" ] && "$HELPER" teardown || true
+}
+
+reload_service() {
+	[ -x "$HELPER" ] || return 1
+	"$HELPER" write-config
+	"$HELPER" setup
+}
+
+EXTRA_COMMANDS="setup teardown add del has socks_list socks_profiles set_socks set_socks_ref set_socks_profile delete_socks_profile test_socks_profile test_socks_ident set_client_socks set_client_socks_ref clear_client_socks"
+EXTRA_HELP="	setup		Recreate nft hooks
+	teardown	Remove nft hooks
+	add IP		Add client IP to SockRoute set
+	del IP		Remove client IP from SockRoute set
+	has IP		Check client IP in runtime set
+	socks_list	List SOCKS outbound candidates
+	socks_profiles	List saved SOCKS profiles
+	set_socks HOST PORT	Set default SOCKS outbound
+	set_socks_ref SECTION	Set default SOCKS profile
+	set_socks_profile SECTION LABEL HOST PORT	Add/update SOCKS profile
+	delete_socks_profile SECTION	Delete SOCKS profile
+	test_socks_profile SECTION	Check SOCKS profile
+	test_socks_ident HOST PORT	Check ident.me through SOCKS endpoint
+	set_client_socks IP HOST PORT	Set client-specific SOCKS outbound
+	set_client_socks_ref IP SECTION	Set client-specific SOCKS profile
+	clear_client_socks IP	Use default SOCKS outbound for client"
+
+setup() {
+	"$HELPER" write-config
+	"$HELPER" setup
+}
+
+teardown() {
+	"$HELPER" teardown
+}
+
+add() {
+	"$HELPER" add "$1"
+}
+
+del() {
+	"$HELPER" del "$1"
+}
+
+has() {
+	"$HELPER" has "$1"
+}
+
+socks_list() {
+	"$HELPER" socks-list
+}
+
+socks_profiles() {
+	"$HELPER" socks-profiles
+}
+
+set_socks() {
+	"$HELPER" set-socks "$1" "$2"
+}
+
+set_socks_ref() {
+	"$HELPER" set-socks-ref "$1"
+}
+
+set_socks_profile() {
+	"$HELPER" set-socks-profile "$1" "$2" "$3" "$4"
+}
+
+delete_socks_profile() {
+	"$HELPER" delete-socks-profile "$1"
+}
+
+test_socks_profile() {
+	"$HELPER" test-socks-profile "$1"
+}
+
+test_socks_ident() {
+	"$HELPER" test-socks-ident "$1" "$2"
+}
+
+set_client_socks() {
+	"$HELPER" set-client-socks "$1" "$2" "$3"
+}
+
+set_client_socks_ref() {
+	"$HELPER" set-client-socks-ref "$1" "$2"
+}
+
+clear_client_socks() {
+	"$HELPER" clear-client-socks "$1"
+}

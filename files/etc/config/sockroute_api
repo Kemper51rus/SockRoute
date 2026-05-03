@@ -1,0 +1,5 @@
+config general 'main'
+	list allowed_source_ip '192.168.1.2'
+	option backend 'sockroute'
+	option allowed_target_cidr '192.168.1.0/24'
+

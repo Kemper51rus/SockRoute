@@ -1,0 +1,1379 @@
+#!/bin/sh
+set -eu
+
+CONFIG="sockroute"
+SECTION="main"
+LOCK_FILE="/var/lock/sockroute.lock"
+NAT_HOOK_COMMENT="sockroute_tcp_hook"
+MANGLE_HOOK_COMMENT="sockroute_udp_hook"
+LEGACY_NAT_HOOK_COMMENT="force_vpn_tcp_hook"
+LEGACY_MANGLE_HOOK_COMMENT="force_vpn_udp_hook"
+
+log() {
+	logger -t sockroute "$*" 2>/dev/null || true
+}
+
+cfg() {
+	key="$1"
+	default="$2"
+	uci -q get "$CONFIG.$SECTION.$key" 2>/dev/null || printf '%s' "$default"
+}
+
+validate_ip4() {
+	value="$1"
+	case "$value" in
+		""|*[!0-9.]*|*.*.*.*.*|*..*|.*|*.)
+			return 1
+			;;
+	esac
+	old_ifs="$IFS"
+	IFS=.
+	set -- $value
+	IFS="$old_ifs"
+	[ "$#" -eq 4 ] || return 1
+	for octet in "$@"; do
+		case "$octet" in
+			""|*[!0-9]*)
+				return 1
+				;;
+		esac
+		[ "$octet" -ge 0 ] 2>/dev/null && [ "$octet" -le 255 ] || return 1
+	done
+	return 0
+}
+
+validate_port() {
+	value="$1"
+	case "$value" in
+		""|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$value" -ge 1 ] 2>/dev/null && [ "$value" -le 65535 ] || return 1
+	return 0
+}
+
+validate_socks_host() {
+	validate_ip4 "$1"
+}
+
+validate_label() {
+	value="$1"
+	[ -n "$value" ] || return 1
+	if printf '%s' "$value" | grep -q '[[:cntrl:]]'; then
+		return 1
+	fi
+	return 0
+}
+
+sanitize_detail() {
+	printf '%s' "$1" | tr '\t\r\n' '   ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
+
+enabled() {
+	case "$(cfg enabled 1)" in
+		0|no|false|off) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+with_lock() {
+	mkdir -p "$(dirname "$LOCK_FILE")"
+	exec 8>"$LOCK_FILE"
+	flock -x 8
+	"$@"
+}
+
+family() { cfg nft_family inet; }
+table() { cfg nft_table passwall2; }
+set_name() { cfg nft_set sockroute_clients; }
+nat_chain() { cfg nft_nat_chain SOCKROUTE_NAT; }
+mangle_chain() { cfg nft_mangle_chain SOCKROUTE_MANGLE; }
+nat_hook_chain() { cfg nft_nat_hook_chain PSW2_NAT; }
+mangle_hook_chain() { cfg nft_mangle_hook_chain PSW2_MANGLE; }
+lan_if() { cfg lan_if br-lan; }
+lan_cidr() { cfg lan_cidr 192.168.1.0/24; }
+listen_port() { cfg listen_port 1042; }
+nft_mark() { cfg nft_mark 0x50535732; }
+
+raw_socks_host() {
+	uci -q get "$CONFIG.$SECTION.socks_host" 2>/dev/null ||
+		cfg passwall_socks_host 127.0.0.1
+}
+
+raw_socks_port() {
+	uci -q get "$CONFIG.$SECTION.socks_port" 2>/dev/null ||
+		cfg passwall_socks_port 1080
+}
+
+socks_profile_sections() {
+	uci show "$CONFIG" 2>/dev/null | sed -n "s/^$CONFIG\.\([^.]*\)=socks$/\1/p"
+}
+
+socks_profile_exists() {
+	ref="$1"
+	[ -n "$ref" ] || return 1
+	for section in $(socks_profile_sections); do
+		[ "$section" = "$ref" ] && return 0
+	done
+	return 1
+}
+
+socks_profile_host() {
+	ref="$1"
+	socks_profile_exists "$ref" || return 1
+	uci -q get "$CONFIG.$ref.host" 2>/dev/null || true
+}
+
+socks_profile_port() {
+	ref="$1"
+	socks_profile_exists "$ref" || return 1
+	uci -q get "$CONFIG.$ref.port" 2>/dev/null || true
+}
+
+socks_profile_label() {
+	ref="$1"
+	socks_profile_exists "$ref" || return 1
+	uci -q get "$CONFIG.$ref.label" 2>/dev/null || printf '%s' "$ref"
+}
+
+socks_profile_section_name() {
+	host="$1"
+	port="$2"
+	printf 'socks_%s_%s' "$(ip_token "$host")" "$port"
+}
+
+next_socks_profile_section_name() {
+	host="$1"
+	port="$2"
+	base="$(socks_profile_section_name "$host" "$port")"
+	candidate="$base"
+	index=2
+
+	while uci -q get "$CONFIG.$candidate" >/dev/null 2>&1; do
+		candidate="${base}_${index}"
+		index=$((index + 1))
+	done
+
+	printf '%s' "$candidate"
+}
+
+main_socks_ref() {
+	uci -q get "$CONFIG.$SECTION.socks_ref" 2>/dev/null || true
+}
+
+socks_host() {
+	ref="$(main_socks_ref)"
+	if socks_profile_exists "$ref"; then
+		host="$(socks_profile_host "$ref")"
+		validate_socks_host "$host" && {
+			printf '%s' "$host"
+			return 0
+		}
+	fi
+	raw_socks_host
+}
+
+socks_port() {
+	ref="$(main_socks_ref)"
+	if socks_profile_exists "$ref"; then
+		port="$(socks_profile_port "$ref")"
+		validate_port "$port" && {
+			printf '%s' "$port"
+			return 0
+		}
+	fi
+	raw_socks_port
+}
+
+client_socks_ref() {
+	client_section="$1"
+	uci -q get "$CONFIG.$client_section.socks_ref" 2>/dev/null || true
+}
+
+client_socks_host() {
+	client_section="$1"
+	ref="$(client_socks_ref "$client_section")"
+	if socks_profile_exists "$ref"; then
+		host="$(socks_profile_host "$ref")"
+		validate_socks_host "$host" && {
+			printf '%s' "$host"
+			return 0
+		}
+	fi
+	uci -q get "$CONFIG.$client_section.socks_host" 2>/dev/null || true
+}
+
+client_socks_port() {
+	client_section="$1"
+	ref="$(client_socks_ref "$client_section")"
+	if socks_profile_exists "$ref"; then
+		port="$(socks_profile_port "$ref")"
+		validate_port "$port" && {
+			printf '%s' "$port"
+			return 0
+		}
+	fi
+	uci -q get "$CONFIG.$client_section.socks_port" 2>/dev/null || true
+}
+
+client_socks_tag() {
+	printf 'client_%s_socks' "$(ip_token "$1")"
+}
+
+client_has_custom_socks() {
+	client_section="$1"
+	default_host="$2"
+	default_port="$3"
+	host="$(client_socks_host "$client_section")"
+	port="$(client_socks_port "$client_section")"
+
+	validate_socks_host "$host" || return 1
+	validate_port "$port" || return 1
+	[ "$host:$port" != "$default_host:$default_port" ]
+}
+
+ip_token() {
+	printf '%s' "$1" | tr '.' '_'
+}
+
+client_section_name() {
+	printf 'client_%s' "$(ip_token "$1")"
+}
+
+client_sections() {
+	uci show "$CONFIG" 2>/dev/null | sed -n "s/^$CONFIG\.\([^.]*\)=client$/\1/p"
+}
+
+client_section_by_ip() {
+	search_ip="$1"
+	for section in $(client_sections); do
+		if [ "$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)" = "$search_ip" ]; then
+			printf '%s' "$section"
+			return 0
+		fi
+	done
+	return 1
+}
+
+upsert_client_profile() {
+	client_ip="$1"
+	label="${2:-$1}"
+
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+	validate_label "$label" || {
+		printf 'ERROR: bad label\n' >&2
+		exit 1
+	}
+
+	section="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$section" ] || section="$(client_section_name "$client_ip")"
+	uci set "$CONFIG.$section=client"
+	uci set "$CONFIG.$section.ip=$client_ip"
+	uci set "$CONFIG.$section.label=$label"
+	uci -q del_list "$CONFIG.$SECTION.hidden_client=$client_ip" 2>/dev/null || true
+	uci commit "$CONFIG"
+}
+
+remove_client_profile() {
+	client_ip="$1"
+	for section in $(client_sections); do
+		if [ "$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)" = "$client_ip" ]; then
+			uci -q delete "$CONFIG.$section" || true
+		fi
+	done
+}
+
+delete_hook_rules() {
+	chain="$1"
+	comment="$2"
+	nft -a list chain "$(family)" "$(table)" "$chain" 2>/dev/null |
+		sed -n "/$comment/s/.* handle \\([0-9][0-9]*\\).*/\\1/p" |
+		while read -r handle; do
+			[ -n "$handle" ] || continue
+			nft delete rule "$(family)" "$(table)" "$chain" handle "$handle" 2>/dev/null || true
+		done
+}
+
+set_has_counter() {
+	nft list set "$(family)" "$(table)" "$(set_name)" 2>/dev/null | grep -q '[[:space:]]counter'
+}
+
+counter_sets_supported() {
+	fam="$(family)"
+	tbl="$(table)"
+	test_set="sockroute_counter_probe_$$"
+
+	if nft add set "$fam" "$tbl" "$test_set" "{ type ipv4_addr; counter; }" >/dev/null 2>&1; then
+		nft delete set "$fam" "$tbl" "$test_set" >/dev/null 2>&1 || true
+		return 0
+	fi
+	return 1
+}
+
+create_client_set() {
+	fam="$1"
+	tbl="$2"
+	set="$3"
+
+	if counter_sets_supported; then
+		nft add set "$fam" "$tbl" "$set" "{ type ipv4_addr; flags interval; counter; comment \"SockRoute clients\"; }"
+	else
+		nft add set "$fam" "$tbl" "$set" "{ type ipv4_addr; flags interval; comment \"SockRoute clients\"; }"
+	fi
+}
+
+runtime_ready() {
+	fam="$(family)"
+	tbl="$(table)"
+	set="$(set_name)"
+	nat_hook="$(nat_hook_chain)"
+	mangle_hook="$(mangle_hook_chain)"
+
+	nft list set "$fam" "$tbl" "$set" >/dev/null 2>&1 || return 1
+	nft list chain "$fam" "$tbl" "$nat_hook" 2>/dev/null | grep -q "$NAT_HOOK_COMMENT" || return 1
+	nft list chain "$fam" "$tbl" "$mangle_hook" 2>/dev/null | grep -q "$MANGLE_HOOK_COMMENT" || return 1
+	return 0
+}
+
+ensure_runtime_ready() {
+	runtime_ready || setup_nft
+}
+
+setup_nft() {
+	enabled || exit 0
+
+	fam="$(family)"
+	tbl="$(table)"
+	set="$(set_name)"
+	nat="$(nat_chain)"
+	mangle="$(mangle_chain)"
+	nat_hook="$(nat_hook_chain)"
+	mangle_hook="$(mangle_hook_chain)"
+	lan="$(lan_if)"
+	cidr="$(lan_cidr)"
+	port="$(listen_port)"
+	mark="$(nft_mark)"
+
+	nft list chain "$fam" "$tbl" "$nat_hook" >/dev/null
+	nft list chain "$fam" "$tbl" "$mangle_hook" >/dev/null
+
+	nft add chain "$fam" "$tbl" "$nat" 2>/dev/null || true
+	nft add chain "$fam" "$tbl" "$mangle" 2>/dev/null || true
+	nft flush chain "$fam" "$tbl" "$nat"
+	nft flush chain "$fam" "$tbl" "$mangle"
+
+	if nft list set "$fam" "$tbl" "$set" >/dev/null 2>&1; then
+		if counter_sets_supported && ! set_has_counter; then
+			nft delete set "$fam" "$tbl" "$set" 2>/dev/null || true
+			create_client_set "$fam" "$tbl" "$set"
+		fi
+	else
+		create_client_set "$fam" "$tbl" "$set"
+	fi
+
+	nft add rule "$fam" "$tbl" "$nat" \
+		iifname "$lan" ip saddr "@$set" ip daddr != "$cidr" ip protocol tcp \
+		counter redirect to ":$port" comment sockroute_tcp
+
+	nft add rule "$fam" "$tbl" "$mangle" \
+		iifname "$lan" ip saddr "@$set" ip daddr != "$cidr" ip protocol udp \
+		counter meta mark set "$mark" ct mark set "$mark" tproxy ip to ":$port" \
+		comment sockroute_udp
+
+	delete_hook_rules "$nat_hook" "$NAT_HOOK_COMMENT"
+	delete_hook_rules "$mangle_hook" "$MANGLE_HOOK_COMMENT"
+	delete_hook_rules "$nat_hook" "$LEGACY_NAT_HOOK_COMMENT"
+	delete_hook_rules "$mangle_hook" "$LEGACY_MANGLE_HOOK_COMMENT"
+	nft insert rule "$fam" "$tbl" "$nat_hook" position 0 jump "$nat" comment "$NAT_HOOK_COMMENT"
+	nft insert rule "$fam" "$tbl" "$mangle_hook" position 0 jump "$mangle" comment "$MANGLE_HOOK_COMMENT"
+
+	for saved_ip in $(uci -q get "$CONFIG.$SECTION.client" 2>/dev/null || true); do
+		validate_ip4 "$saved_ip" || continue
+		nft add element "$fam" "$tbl" "$set" "{ $saved_ip }" 2>/dev/null || true
+	done
+}
+
+teardown_nft() {
+	fam="$(family)"
+	tbl="$(table)"
+	set="$(set_name)"
+	nat="$(nat_chain)"
+	mangle="$(mangle_chain)"
+	nat_hook="$(nat_hook_chain)"
+	mangle_hook="$(mangle_hook_chain)"
+
+	delete_hook_rules "$nat_hook" "$NAT_HOOK_COMMENT"
+	delete_hook_rules "$mangle_hook" "$MANGLE_HOOK_COMMENT"
+	delete_hook_rules "$nat_hook" "$LEGACY_NAT_HOOK_COMMENT"
+	delete_hook_rules "$mangle_hook" "$LEGACY_MANGLE_HOOK_COMMENT"
+
+	nft flush chain "$fam" "$tbl" "$nat" 2>/dev/null || true
+	nft delete chain "$fam" "$tbl" "$nat" 2>/dev/null || true
+	nft flush chain "$fam" "$tbl" "$mangle" 2>/dev/null || true
+	nft delete chain "$fam" "$tbl" "$mangle" 2>/dev/null || true
+	nft delete set "$fam" "$tbl" "$set" 2>/dev/null || true
+	nft flush chain "$fam" "$tbl" FORCE_VPN_NAT 2>/dev/null || true
+	nft delete chain "$fam" "$tbl" FORCE_VPN_NAT 2>/dev/null || true
+	nft flush chain "$fam" "$tbl" FORCE_VPN_MANGLE 2>/dev/null || true
+	nft delete chain "$fam" "$tbl" FORCE_VPN_MANGLE 2>/dev/null || true
+	nft delete set "$fam" "$tbl" force_vpn_clients 2>/dev/null || true
+}
+
+write_config() {
+	config_file="$(cfg sing_box_config /etc/sockroute/sing-box.json)"
+	log_file="$(cfg log_file /tmp/sockroute.log)"
+	port="$(listen_port)"
+	socks_host="$(socks_host)"
+	socks_port="$(socks_port)"
+	cidr="$(lan_cidr)"
+
+	validate_port "$port" || {
+		printf 'ERROR: bad listen port\n' >&2
+		exit 1
+	}
+	validate_socks_host "$socks_host" || {
+		printf 'ERROR: bad socks host\n' >&2
+		exit 1
+	}
+	validate_port "$socks_port" || {
+		printf 'ERROR: bad socks port\n' >&2
+		exit 1
+	}
+
+	mkdir -p "$(dirname "$config_file")"
+	cat > "$config_file" <<EOF
+{
+  "log": {
+    "disabled": false,
+    "level": "warn",
+    "timestamp": true,
+    "output": "$log_file"
+  },
+  "inbounds": [
+    {
+      "type": "redirect",
+      "tag": "redirect_tcp",
+      "listen": "::",
+      "listen_port": $port
+    },
+    {
+      "type": "tproxy",
+      "tag": "tproxy_udp",
+      "listen": "::",
+      "listen_port": $port,
+      "network": "udp"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "default_socks",
+      "server": "$socks_host",
+      "server_port": $socks_port,
+      "version": "5"
+    },
+    {
+      "type": "direct",
+      "tag": "direct",
+      "routing_mark": 255
+    }
+EOF
+
+	for section in $(client_sections); do
+		ip="$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)"
+		validate_ip4 "$ip" || continue
+		client_has_custom_socks "$section" "$socks_host" "$socks_port" || continue
+		host="$(client_socks_host "$section")"
+		port_value="$(client_socks_port "$section")"
+		tag="$(client_socks_tag "$ip")"
+		cat >> "$config_file" <<EOF
+    ,
+    {
+      "type": "socks",
+      "tag": "$tag",
+      "server": "$host",
+      "server_port": $port_value,
+      "version": "5"
+    }
+EOF
+	done
+
+	cat >> "$config_file" <<EOF
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff",
+        "inbound": "redirect_tcp"
+      },
+      {
+        "action": "sniff",
+        "inbound": "tproxy_udp"
+      },
+      {
+        "action": "route",
+        "ip_cidr": [
+          "$cidr"
+        ],
+        "outbound": "direct"
+      }
+EOF
+
+	for section in $(client_sections); do
+		ip="$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)"
+		validate_ip4 "$ip" || continue
+		client_has_custom_socks "$section" "$socks_host" "$socks_port" || continue
+		tag="$(client_socks_tag "$ip")"
+		cat >> "$config_file" <<EOF
+      ,
+      {
+        "action": "route",
+        "source_ip_cidr": [
+          "$ip/32"
+        ],
+        "outbound": "$tag"
+      }
+EOF
+	done
+
+	cat >> "$config_file" <<EOF
+    ],
+    "final": "default_socks"
+  }
+}
+EOF
+}
+
+normalize_connect_host() {
+	case "${1:-}" in
+		""|0.0.0.0|::)
+			printf '127.0.0.1'
+			;;
+		*)
+			printf '%s' "$1"
+			;;
+	esac
+}
+
+SOCKS_CANDIDATE_KEYS=" "
+
+emit_socks_candidate() {
+	host="$(normalize_connect_host "${1:-}")"
+	port="${2:-}"
+	label="${3:-SOCKS}"
+	source="${4:-manual}"
+	key="$host:$port"
+
+	validate_socks_host "$host" || return 0
+	validate_port "$port" || return 0
+	case "$SOCKS_CANDIDATE_KEYS" in
+		*" $key "*) return 0 ;;
+	esac
+	SOCKS_CANDIDATE_KEYS="${SOCKS_CANDIDATE_KEYS}${key} "
+	printf '%s\t%s\t%s\t%s\n' "$host" "$port" "$label" "$source"
+}
+
+uci_node_remarks() {
+	node="$1"
+	if [ -z "$node" ]; then
+		printf 'unknown'
+		return 0
+	fi
+	uci -q get "passwall2.$node.remarks" 2>/dev/null || printf '%s' "$node"
+}
+
+uci_node_path_label() {
+	node="$1"
+	if [ -z "$node" ]; then
+		printf 'unknown'
+		return 0
+	fi
+
+	remarks="$(uci_node_remarks "$node")"
+	default_node="$(uci -q get "passwall2.$node.default_node" 2>/dev/null || true)"
+	if [ -n "$default_node" ]; then
+		default_remarks="$(uci_node_remarks "$default_node")"
+		printf '%s -> %s' "$remarks" "$default_remarks"
+	else
+		printf '%s' "$remarks"
+	fi
+}
+
+runtime_socks_label() {
+	file="$1"
+	base="$(basename "$file")"
+
+	case "$base" in
+		global_default_*_*.json)
+			node="${base#global_default_}"
+			node="${node%_*}"
+			printf 'PassWall2 runtime default SOCKS: %s (%s)' "$(uci_node_remarks "$node")" "$base"
+			;;
+		SOCKS_*.json)
+			section="${base#SOCKS_}"
+			section="${section%.json}"
+			node="$(uci -q get "passwall2.$section.node" 2>/dev/null || true)"
+			printf 'PassWall2 runtime SOCKS inbound: %s (%s)' "$(uci_node_remarks "$node")" "$base"
+			;;
+		global.json)
+			global_node="$(uci -q get passwall2.@global[0].node 2>/dev/null || true)"
+			printf 'PassWall2 routing runtime SOCKS: %s (%s)' "$(uci_node_path_label "$global_node")" "$base"
+			;;
+		*)
+			printf 'Runtime SOCKS: %s' "$base"
+			;;
+	esac
+}
+
+describe_socks_endpoint() {
+	search_host="$(normalize_connect_host "${1:-}")"
+	search_port="${2:-}"
+
+	for file in /tmp/etc/passwall2/*.json /tmp/etc/passwall2/acl/*/*.json; do
+		[ -f "$file" ] || continue
+		candidate="$(runtime_socks_candidate "$file")"
+		[ -n "$candidate" ] || continue
+		set -- $candidate
+		if [ "$(normalize_connect_host "$1")" = "$search_host" ] && [ "$2" = "$search_port" ]; then
+			runtime_socks_label "$file"
+			return 0
+		fi
+	done
+
+	global_port="$(uci -q get passwall2.@global[0].node_socks_port 2>/dev/null || true)"
+	if [ "$search_host" = "127.0.0.1" ] && [ "$search_port" = "$global_port" ]; then
+		global_node="$(uci -q get passwall2.@global[0].node 2>/dev/null || true)"
+		printf 'PassWall2 main routing SOCKS: %s' "$(uci_node_path_label "$global_node")"
+		return 0
+	fi
+
+	for section in $(uci show passwall2 2>/dev/null | sed -n "s/^passwall2\.\([^.]*\)=socks$/\1/p"); do
+		port_section="$(uci -q get "passwall2.$section.port" 2>/dev/null || true)"
+		[ "$search_host" = "127.0.0.1" ] && [ "$search_port" = "$port_section" ] || continue
+		node_section="$(uci -q get "passwall2.$section.node" 2>/dev/null || true)"
+		printf 'PassWall2 SOCKS inbound: %s (section %s)' "$(uci_node_remarks "$node_section")" "$section"
+		return 0
+	done
+
+	printf 'SOCKS outbound'
+}
+
+list_known_uci_socks_candidates() {
+	[ -f /etc/config/passwall2 ] || return 0
+
+	global_port="$(uci -q get passwall2.@global[0].node_socks_port 2>/dev/null || true)"
+	global_enabled="$(uci -q get passwall2.@global[0].socks_enabled 2>/dev/null || printf '1')"
+	if [ "$global_enabled" != "0" ]; then
+		global_node="$(uci -q get passwall2.@global[0].node 2>/dev/null || true)"
+		emit_socks_candidate 127.0.0.1 "$global_port" "PassWall2 main routing SOCKS: $(uci_node_path_label "$global_node")" "passwall2.global"
+	fi
+
+	for section in $(uci show passwall2 2>/dev/null | sed -n "s/^passwall2\.\([^.]*\)=socks$/\1/p"); do
+		enabled_section="$(uci -q get "passwall2.$section.enabled" 2>/dev/null || printf '1')"
+		[ "$enabled_section" != "0" ] || continue
+		port_section="$(uci -q get "passwall2.$section.port" 2>/dev/null || true)"
+		node_section="$(uci -q get "passwall2.$section.node" 2>/dev/null || true)"
+		emit_socks_candidate 127.0.0.1 "$port_section" "PassWall2 SOCKS inbound: $(uci_node_remarks "$node_section") (section $section)" "passwall2.socks"
+	done
+}
+
+list_server_outbound_socks_candidates() {
+	[ -f /etc/config/passwall2_server ] || return 0
+
+	for section in $(uci show passwall2_server 2>/dev/null | sed -n "s/^passwall2_server\.\([^.]*\)=user$/\1/p"); do
+		enabled_section="$(uci -q get "passwall2_server.$section.enable" 2>/dev/null || printf '1')"
+		[ "$enabled_section" != "0" ] || continue
+		outbound="$(uci -q get "passwall2_server.$section.outbound_node" 2>/dev/null || true)"
+		[ "$outbound" = "_socks" ] || continue
+		host_section="$(uci -q get "passwall2_server.$section.outbound_node_address" 2>/dev/null || true)"
+		port_section="$(uci -q get "passwall2_server.$section.outbound_node_port" 2>/dev/null || true)"
+		remarks="$(uci -q get "passwall2_server.$section.remarks" 2>/dev/null || printf '%s' "$section")"
+		emit_socks_candidate "$host_section" "$port_section" "Server outbound: $remarks" "server"
+	done
+}
+
+runtime_socks_candidate() {
+	file="$1"
+	awk '
+		/"protocol"[[:space:]]*:[[:space:]]*"socks"/ || /"type"[[:space:]]*:[[:space:]]*"socks"/ {
+			is_socks = 1
+		}
+		/"listen"[[:space:]]*:/ && listen == "" {
+			line = $0
+			sub(/^.*"listen"[[:space:]]*:[[:space:]]*"/, "", line)
+			sub(/".*$/, "", line)
+			listen = line
+		}
+		/"listen_port"[[:space:]]*:/ && port == "" {
+			line = $0
+			sub(/^.*"listen_port"[[:space:]]*:[[:space:]]*/, "", line)
+			sub(/[^0-9].*$/, "", line)
+			port = line
+		}
+		/"port"[[:space:]]*:/ && port == "" {
+			line = $0
+			sub(/^.*"port"[[:space:]]*:[[:space:]]*/, "", line)
+			sub(/[^0-9].*$/, "", line)
+			port = line
+		}
+		END {
+			if (is_socks && port != "") {
+				if (listen == "" || listen == "0.0.0.0" || listen == "::") {
+					listen = "127.0.0.1"
+				}
+				print listen, port
+			}
+		}
+	' "$file" 2>/dev/null || true
+}
+
+list_runtime_socks_candidates() {
+	for file in /tmp/etc/passwall2/*.json /tmp/etc/passwall2/acl/*/*.json; do
+		[ -f "$file" ] || continue
+		candidate="$(runtime_socks_candidate "$file")"
+		[ -n "$candidate" ] || continue
+		set -- $candidate
+		emit_socks_candidate "$1" "$2" "$(runtime_socks_label "$file")" "runtime"
+	done
+}
+
+list_socks_candidates() {
+	SOCKS_CANDIDATE_KEYS=" "
+	current_host="$(socks_host)"
+	current_port="$(socks_port)"
+	emit_socks_candidate "$current_host" "$current_port" "$(describe_socks_endpoint "$current_host" "$current_port") (сейчас)" "current"
+	list_known_uci_socks_candidates
+	list_server_outbound_socks_candidates
+	list_runtime_socks_candidates
+}
+
+list_socks_profiles() {
+	main_ref="$(main_socks_ref)"
+	for section in $(socks_profile_sections); do
+		label="$(socks_profile_label "$section")"
+		host="$(socks_profile_host "$section")"
+		port="$(socks_profile_port "$section")"
+		check="$(uci -q get "$CONFIG.$section.last_check" 2>/dev/null || printf 'unknown')"
+		detail="$(uci -q get "$CONFIG.$section.last_check_detail" 2>/dev/null || printf 'не проверялся')"
+		[ "$section" = "$main_ref" ] && active="default" || active=""
+		validate_socks_host "$host" || continue
+		validate_port "$port" || continue
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$label" "$host" "$port" "$check" "$(sanitize_detail "$detail")" "$active"
+	done
+}
+
+test_socks_endpoint() {
+	host="$1"
+	port="$2"
+	section="${3:-}"
+	status="fail"
+	detail=""
+
+	validate_socks_host "$host" || {
+		detail="bad host"
+		health_line socks fail "$detail"
+		return 1
+	}
+	validate_port "$port" || {
+		detail="bad port"
+		health_line socks fail "$detail"
+		return 1
+	}
+
+	if command -v curl >/dev/null 2>&1; then
+		if output="$(curl -I -sS --socks5-hostname "$host:$port" --connect-timeout 2 --max-time 5 http://1.1.1.1/ 2>&1)"; then
+			http_code="$(printf '%s\n' "$output" | sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p')"
+			status="ok"
+			if [ -n "$http_code" ]; then
+				detail="SOCKS доступен, HTTP $http_code от 1.1.1.1"
+			else
+				detail="SOCKS доступен"
+			fi
+		else
+			status="fail"
+			detail="$(printf '%s\n' "$output" | sed -n '1p')"
+			detail="${detail:-SOCKS не ответил}"
+			detail="SOCKS ошибка: $detail"
+		fi
+	elif [ "$host" = "127.0.0.1" ] || [ "$host" = "0.0.0.0" ]; then
+		if port_listening "$port"; then
+			status="ok"
+			detail="порт слушается локально"
+		else
+			status="fail"
+			detail="порт не найден локально"
+		fi
+	else
+		status="warn"
+		detail="curl недоступен, удалённый SOCKS не проверен"
+	fi
+
+	detail="$(sanitize_detail "$detail")"
+	if [ -n "$section" ] && socks_profile_exists "$section"; then
+		uci set "$CONFIG.$section.last_check=$status"
+		uci set "$CONFIG.$section.last_check_detail=$detail"
+		uci set "$CONFIG.$section.last_check_time=$(date +%Y-%m-%d_%H:%M:%S 2>/dev/null || true)"
+		uci commit "$CONFIG"
+	fi
+	health_line socks "$status" "$detail"
+	[ "$status" = "fail" ] && return 1
+	return 0
+}
+
+set_socks_profile() {
+	section="${1:-}"
+	label="${2:-}"
+	host="${3:-}"
+	port="${4:-}"
+
+	validate_label "$label" || {
+		printf 'ERROR: bad label\n' >&2
+		exit 1
+	}
+	validate_socks_host "$host" || {
+		printf 'ERROR: bad socks host\n' >&2
+		exit 1
+	}
+	validate_port "$port" || {
+		printf 'ERROR: bad socks port\n' >&2
+		exit 1
+	}
+
+	if [ -z "$section" ] || [ "$section" = "-" ]; then
+		section="$(next_socks_profile_section_name "$host" "$port")"
+	elif ! socks_profile_exists "$section"; then
+		section="$(next_socks_profile_section_name "$host" "$port")"
+	fi
+	result_section="$section"
+
+	uci set "$CONFIG.$section=socks"
+	uci set "$CONFIG.$section.label=$label"
+	uci set "$CONFIG.$section.host=$host"
+	uci set "$CONFIG.$section.port=$port"
+	uci commit "$CONFIG"
+	test_socks_endpoint "$host" "$port" "$section" >/dev/null 2>&1 || true
+	write_config
+	printf '%s\n' "$result_section"
+}
+
+delete_socks_profile() {
+	section="${1:-}"
+	socks_profile_exists "$section" || return 0
+
+	host="$(socks_profile_host "$section")"
+	port="$(socks_profile_port "$section")"
+
+	if [ "$(main_socks_ref)" = "$section" ]; then
+		uci set "$CONFIG.$SECTION.socks_host=$host"
+		uci set "$CONFIG.$SECTION.socks_port=$port"
+		uci -q delete "$CONFIG.$SECTION.socks_ref" 2>/dev/null || true
+	fi
+
+	for client_section in $(client_sections); do
+		if [ "$(client_socks_ref "$client_section")" = "$section" ]; then
+			uci set "$CONFIG.$client_section.socks_host=$host"
+			uci set "$CONFIG.$client_section.socks_port=$port"
+			uci -q delete "$CONFIG.$client_section.socks_ref" 2>/dev/null || true
+		fi
+	done
+
+	uci -q delete "$CONFIG.$section" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+}
+
+set_socks_ref() {
+	ref="${1:-}"
+	socks_profile_exists "$ref" || {
+		printf 'ERROR: bad socks profile\n' >&2
+		exit 1
+	}
+	host="$(socks_profile_host "$ref")"
+	port="$(socks_profile_port "$ref")"
+	uci set "$CONFIG.$SECTION.socks_ref=$ref"
+	uci set "$CONFIG.$SECTION.socks_host=$host"
+	uci set "$CONFIG.$SECTION.socks_port=$port"
+	uci -q delete "$CONFIG.$SECTION.passwall_socks_host" 2>/dev/null || true
+	uci -q delete "$CONFIG.$SECTION.passwall_socks_port" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+}
+
+test_socks_ident() {
+	host="$1"
+	port="$2"
+	status="fail"
+	detail=""
+
+	validate_socks_host "$host" || {
+		health_line ident fail "bad host"
+		return 1
+	}
+	validate_port "$port" || {
+		health_line ident fail "bad port"
+		return 1
+	}
+
+	if ! command -v curl >/dev/null 2>&1; then
+		health_line ident fail "curl не найден"
+		return 1
+	fi
+
+	if output="$(curl -fsS --socks5-hostname "$host:$port" --connect-timeout 3 --max-time 8 https://ident.me 2>&1)"; then
+		status="ok"
+		detail="ident.me: $(printf '%s' "$output" | sed -n '1p')"
+	else
+		status="fail"
+		detail="$(printf '%s' "$output" | sed -n '1p')"
+		detail="${detail:-ident.me не ответил}"
+	fi
+
+	detail="$(sanitize_detail "$detail")"
+	health_line ident "$status" "$detail"
+	[ "$status" = "fail" ] && return 1
+	return 0
+}
+
+test_socks_profile() {
+	section="${1:-}"
+	socks_profile_exists "$section" || {
+		printf 'ERROR: bad socks profile\n' >&2
+		exit 1
+	}
+	test_socks_endpoint "$(socks_profile_host "$section")" "$(socks_profile_port "$section")" "$section"
+}
+
+health_line() {
+	printf '%s\t%s\t%s\n' "$1" "$2" "$3"
+}
+
+port_listening() {
+	port="$1"
+
+	if command -v ss >/dev/null 2>&1; then
+		ss -ln 2>/dev/null | awk -v p=":$port" '$0 ~ p { found = 1 } END { exit found ? 0 : 1 }'
+		return $?
+	fi
+	if command -v netstat >/dev/null 2>&1; then
+		netstat -ln 2>/dev/null | awk -v p=":$port" '$0 ~ p { found = 1 } END { exit found ? 0 : 1 }'
+		return $?
+	fi
+	return 2
+}
+
+list_health() {
+	fam="$(family)"
+	tbl="$(table)"
+	set="$(set_name)"
+	nat="$(nat_chain)"
+	mangle="$(mangle_chain)"
+	nat_hook="$(nat_hook_chain)"
+	mangle_hook="$(mangle_hook_chain)"
+	port="$(listen_port)"
+	socks="$(socks_host):$(socks_port)"
+	config_file="$(cfg sing_box_config /etc/sockroute/sing-box.json)"
+	sing_box_bin="$(cfg sing_box_bin /usr/bin/sing-box)"
+
+	if [ -x /etc/init.d/sockroute ] && /etc/init.d/sockroute running >/dev/null 2>&1; then
+		health_line service ok "sockroute запущен"
+	else
+		health_line service warn "sockroute не запущен"
+	fi
+
+	if [ -x "$sing_box_bin" ]; then
+		health_line sing-box ok "$sing_box_bin найден"
+	else
+		health_line sing-box fail "$sing_box_bin не найден или не исполняемый"
+	fi
+
+	if [ -f "$config_file" ]; then
+		health_line config ok "$config_file найден"
+	else
+		health_line config warn "$config_file не найден"
+	fi
+
+	if port_listening "$port"; then
+		health_line transparent-port ok "порт $port слушается"
+	else
+		health_line transparent-port warn "порт $port не найден в listen-сокетах"
+	fi
+
+	if nft list set "$fam" "$tbl" "$set" >/dev/null 2>&1; then
+		count="$(nft list set "$fam" "$tbl" "$set" 2>/dev/null | sed -n 's/.*elements = { \(.*\) }.*/\1/p' | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+		health_line nft-set ok "$fam $tbl $set, elements: ${count:-0}"
+	else
+		health_line nft-set fail "$fam $tbl $set не найден"
+	fi
+
+	if nft list chain "$fam" "$tbl" "$nat" >/dev/null 2>&1; then
+		health_line tcp-chain ok "$nat найден"
+	else
+		health_line tcp-chain fail "$nat не найден"
+	fi
+
+	if nft list chain "$fam" "$tbl" "$mangle" >/dev/null 2>&1; then
+		health_line udp-chain ok "$mangle найден"
+	else
+		health_line udp-chain fail "$mangle не найден"
+	fi
+
+	if nft list chain "$fam" "$tbl" "$nat_hook" 2>/dev/null | grep -q "$NAT_HOOK_COMMENT"; then
+		health_line tcp-hook ok "$nat_hook содержит $NAT_HOOK_COMMENT"
+	else
+		health_line tcp-hook fail "$nat_hook не содержит $NAT_HOOK_COMMENT"
+	fi
+
+	if nft list chain "$fam" "$tbl" "$mangle_hook" 2>/dev/null | grep -q "$MANGLE_HOOK_COMMENT"; then
+		health_line udp-hook ok "$mangle_hook содержит $MANGLE_HOOK_COMMENT"
+	else
+		health_line udp-hook fail "$mangle_hook не содержит $MANGLE_HOOK_COMMENT"
+	fi
+
+	main_ref="$(main_socks_ref)"
+	if [ -n "$main_ref" ] && socks_profile_exists "$main_ref"; then
+		last_check="$(uci -q get "$CONFIG.$main_ref.last_check" 2>/dev/null || printf 'unknown')"
+		last_detail="$(uci -q get "$CONFIG.$main_ref.last_check_detail" 2>/dev/null || true)"
+		case "$last_check" in
+			ok) health_line socks-outbound ok "$socks: ${last_detail:-последняя проверка OK}" ;;
+			fail) health_line socks-outbound warn "$socks: ${last_detail:-последняя проверка FAIL}" ;;
+			*) health_line socks-outbound warn "$socks: не проверялся" ;;
+		esac
+	elif [ "$(socks_host)" = "127.0.0.1" ] || [ "$(socks_host)" = "0.0.0.0" ]; then
+		if port_listening "$(socks_port)"; then
+			health_line socks-outbound ok "$socks обнаружен в listen-сокетах"
+		else
+			health_line socks-outbound warn "$socks не найден в listen-сокетах"
+		fi
+	else
+		health_line socks-outbound warn "$socks remote, используйте ручную проверку SOCKS"
+	fi
+
+	if [ -x /usr/libexec/sockroute-api ] && [ -x /www/cgi-bin/sockroute-api ]; then
+		health_line api ok "CLI и CGI endpoint установлены"
+	else
+		health_line api warn "sockroute-api установлен не полностью"
+	fi
+}
+
+list_dhcp_hosts() {
+	[ -f /etc/config/dhcp ] || return 0
+
+	for section in $(uci show dhcp 2>/dev/null | sed -n "s/^dhcp\.\([^.]*\)=host$/\1/p"); do
+		ip="$(uci -q get "dhcp.$section.ip" 2>/dev/null || true)"
+		validate_ip4 "$ip" || continue
+		name="$(uci -q get "dhcp.$section.name" 2>/dev/null || true)"
+		[ -n "$name" ] || name="$(uci -q get "dhcp.$section.hostname" 2>/dev/null || true)"
+		[ -n "$name" ] || name="$section"
+		mac="$(uci -q get "dhcp.$section.mac" 2>/dev/null || true)"
+		printf '%s\t%s\t%s\t%s\n' "$section" "$ip" "$name" "$mac"
+	done
+}
+
+check_client() {
+	client_ip="$1"
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+
+	if uci -q get "$CONFIG.$SECTION.client" 2>/dev/null | tr ' ' '\n' | grep -qx "$client_ip"; then
+		health_line saved ok "IP сохранён в sockroute.main.client"
+	else
+		health_line saved warn "IP не сохранён в sockroute.main.client"
+	fi
+
+	section="$(client_section_by_ip "$client_ip" || true)"
+	if [ -n "$section" ]; then
+		label="$(uci -q get "$CONFIG.$section.label" 2>/dev/null || printf '%s' "$client_ip")"
+		health_line profile ok "$section: $label"
+		custom_host="$(client_socks_host "$section")"
+		custom_port="$(client_socks_port "$section")"
+		if validate_socks_host "$custom_host" && validate_port "$custom_port"; then
+			health_line outbound ok "client SOCKS $custom_host:$custom_port"
+		else
+			health_line outbound ok "default SOCKS $(socks_host):$(socks_port)"
+		fi
+	else
+		health_line profile warn "профиль клиента не найден"
+		health_line outbound ok "default SOCKS $(socks_host):$(socks_port)"
+	fi
+
+	if uci -q get "$CONFIG.$SECTION.hidden_client" 2>/dev/null | tr ' ' '\n' | grep -qx "$client_ip"; then
+		health_line hidden warn "IP скрыт из списка клиентов"
+	else
+		health_line hidden ok "IP не скрыт"
+	fi
+
+	if nft get element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" >/dev/null 2>&1; then
+		health_line runtime ok "IP есть в nft set $(set_name)"
+	else
+		health_line runtime warn "IP не найден в nft set $(set_name)"
+	fi
+
+	counter_line="$(list_client_counters | awk -v ip="$client_ip" '$1 == ip { print $2 " packets / " $3 " bytes" }' | sed -n '1p')"
+	if [ -n "$counter_line" ]; then
+		health_line counters ok "$counter_line"
+	else
+		health_line counters warn "счётчик для IP не найден или nft set без counters"
+	fi
+
+	if nft list chain "$(family)" "$(table)" "$(nat_hook_chain)" 2>/dev/null | grep -q "$NAT_HOOK_COMMENT" &&
+		nft list chain "$(family)" "$(table)" "$(mangle_hook_chain)" 2>/dev/null | grep -q "$MANGLE_HOOK_COMMENT"; then
+		health_line hooks ok "TCP/UDP hook-правила установлены"
+	else
+		health_line hooks fail "TCP/UDP hook-правила не полностью установлены"
+	fi
+}
+
+set_socks() {
+	host="${1:-}"
+	port="${2:-}"
+
+	validate_socks_host "$host" || {
+		printf 'ERROR: bad socks host\n' >&2
+		exit 1
+	}
+	validate_port "$port" || {
+		printf 'ERROR: bad socks port\n' >&2
+		exit 1
+	}
+
+	uci set "$CONFIG.$SECTION.socks_host=$host"
+	uci set "$CONFIG.$SECTION.socks_port=$port"
+	uci -q delete "$CONFIG.$SECTION.socks_ref" 2>/dev/null || true
+	uci -q delete "$CONFIG.$SECTION.passwall_socks_host" 2>/dev/null || true
+	uci -q delete "$CONFIG.$SECTION.passwall_socks_port" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+	log "updated SockRoute SOCKS outbound to $host:$port"
+}
+
+set_client_socks() {
+	client_ip="${1:-}"
+	host="${2:-}"
+	port="${3:-}"
+
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+	validate_socks_host "$host" || {
+		printf 'ERROR: bad socks host\n' >&2
+		exit 1
+	}
+	validate_port "$port" || {
+		printf 'ERROR: bad socks port\n' >&2
+		exit 1
+	}
+
+	section="$(client_section_by_ip "$client_ip" || true)"
+	if [ -z "$section" ]; then
+		upsert_client_profile "$client_ip" "$client_ip"
+		section="$(client_section_by_ip "$client_ip" || true)"
+	fi
+	[ -n "$section" ] || exit 1
+
+	uci set "$CONFIG.$section.socks_host=$host"
+	uci set "$CONFIG.$section.socks_port=$port"
+	uci -q delete "$CONFIG.$section.socks_ref" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+	log "updated SockRoute client $client_ip SOCKS outbound to $host:$port"
+}
+
+set_client_socks_ref() {
+	client_ip="${1:-}"
+	ref="${2:-}"
+
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+	socks_profile_exists "$ref" || {
+		printf 'ERROR: bad socks profile\n' >&2
+		exit 1
+	}
+
+	section="$(client_section_by_ip "$client_ip" || true)"
+	if [ -z "$section" ]; then
+		upsert_client_profile "$client_ip" "$client_ip"
+		section="$(client_section_by_ip "$client_ip" || true)"
+	fi
+	[ -n "$section" ] || exit 1
+
+	uci set "$CONFIG.$section.socks_ref=$ref"
+	uci -q delete "$CONFIG.$section.socks_host" 2>/dev/null || true
+	uci -q delete "$CONFIG.$section.socks_port" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+	log "updated SockRoute client $client_ip SOCKS profile to $ref"
+}
+
+clear_client_socks() {
+	client_ip="${1:-}"
+
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+
+	section="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$section" ] || return 0
+	uci -q delete "$CONFIG.$section.socks_ref" 2>/dev/null || true
+	uci -q delete "$CONFIG.$section.socks_host" 2>/dev/null || true
+	uci -q delete "$CONFIG.$section.socks_port" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+	log "cleared SockRoute client $client_ip SOCKS outbound"
+}
+
+add_client() {
+	client_ip="$1"
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+	ensure_runtime_ready
+	nft add element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" 2>/dev/null || true
+	if ! uci -q get "$CONFIG.$SECTION.client" 2>/dev/null | tr ' ' '\n' | grep -qx "$client_ip"; then
+		uci add_list "$CONFIG.$SECTION.client=$client_ip"
+	fi
+	uci -q del_list "$CONFIG.$SECTION.hidden_client=$client_ip" 2>/dev/null || true
+	uci commit "$CONFIG"
+	log "enabled SockRoute for $client_ip"
+}
+
+add_named_client() {
+	client_ip="$1"
+	label="${2:-$1}"
+	upsert_client_profile "$client_ip" "$label"
+	add_client "$client_ip"
+}
+
+del_client() {
+	client_ip="$1"
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+	nft delete element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" 2>/dev/null || true
+	uci -q del_list "$CONFIG.$SECTION.client=$client_ip" 2>/dev/null || true
+	uci commit "$CONFIG"
+	log "disabled SockRoute for $client_ip"
+}
+
+rename_client() {
+	client_ip="$1"
+	label="${2:-$1}"
+	upsert_client_profile "$client_ip" "$label"
+	log "renamed SockRoute client $client_ip to $label"
+}
+
+delete_client() {
+	client_ip="$1"
+	validate_ip4 "$client_ip" || {
+		printf 'ERROR: bad ip\n' >&2
+		exit 1
+	}
+	nft delete element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" 2>/dev/null || true
+	uci -q del_list "$CONFIG.$SECTION.client=$client_ip" 2>/dev/null || true
+	uci add_list "$CONFIG.$SECTION.hidden_client=$client_ip" 2>/dev/null || true
+	remove_client_profile "$client_ip"
+	uci commit "$CONFIG"
+	log "deleted SockRoute client $client_ip"
+}
+
+has_client() {
+	client_ip="$1"
+	validate_ip4 "$client_ip" || exit 1
+	nft get element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" >/dev/null 2>&1
+}
+
+list_client_counters() {
+	nft list set "$(family)" "$(table)" "$(set_name)" 2>/dev/null |
+		tr '\n' ' ' |
+		sed -n 's/.*elements = { \(.*\) }.*/\1/p' |
+		tr ',' '\n' |
+		awk '
+			{
+				ip = $1
+				packets = 0
+				bytes = 0
+				for (i = 2; i <= NF; i++) {
+					if ($i == "packets") packets = $(i + 1)
+					if ($i == "bytes") bytes = $(i + 1)
+				}
+				if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+					print ip "\t" packets "\t" bytes
+				}
+			}
+		'
+}
+
+list_status() {
+	printf 'saved_clients:\n'
+	for saved_ip in $(uci -q get "$CONFIG.$SECTION.client" 2>/dev/null || true); do
+		validate_ip4 "$saved_ip" || continue
+		printf '%s\n' "$saved_ip"
+	done
+
+	printf '\nclient_profiles:\n'
+	for section in $(client_sections); do
+		ip="$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)"
+		label="$(uci -q get "$CONFIG.$section.label" 2>/dev/null || printf '%s' "$ip")"
+		profile_socks_ref="$(client_socks_ref "$section")"
+		profile_socks_host="$(client_socks_host "$section")"
+		profile_socks_port="$(client_socks_port "$section")"
+		validate_ip4 "$ip" || continue
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$ip" "$label" "$profile_socks_ref" "$profile_socks_host" "$profile_socks_port"
+	done
+
+	printf '\nhidden_clients:\n'
+	for hidden_ip in $(uci -q get "$CONFIG.$SECTION.hidden_client" 2>/dev/null || true); do
+		validate_ip4 "$hidden_ip" || continue
+		printf '%s\n' "$hidden_ip"
+	done
+
+	printf '\nruntime_set:\n'
+	nft list set "$(family)" "$(table)" "$(set_name)" 2>/dev/null || true
+
+	printf '\nclient_counters:\n'
+	list_client_counters
+}
+
+case "${1:-}" in
+	setup) with_lock setup_nft ;;
+	teardown) with_lock teardown_nft ;;
+	ready|runtime-ready|check-runtime) runtime_ready ;;
+	write-config) write_config ;;
+	add) with_lock add_client "${2:-}" ;;
+	add-named|add_named) with_lock add_named_client "${2:-}" "${3:-}" ;;
+	del|delete|remove) with_lock del_client "${2:-}" ;;
+	delete-client|delete_client) with_lock delete_client "${2:-}" ;;
+	rename|set-label|set_label) with_lock rename_client "${2:-}" "${3:-}" ;;
+	has|status) with_lock has_client "${2:-}" ;;
+	list|show) with_lock list_status ;;
+	socks-list|list-socks|socks) list_socks_candidates ;;
+	socks-profiles|list-socks-profiles) list_socks_profiles ;;
+	set-socks-profile|set_socks_profile) with_lock set_socks_profile "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+	delete-socks-profile|delete_socks_profile) with_lock delete_socks_profile "${2:-}" ;;
+	test-socks-profile|test_socks_profile) with_lock test_socks_profile "${2:-}" ;;
+	test-socks|check-socks) test_socks_endpoint "${2:-}" "${3:-}" ;;
+	test-socks-ident|check-socks-ident) test_socks_ident "${2:-}" "${3:-}" ;;
+	health|check) list_health ;;
+	dhcp-list|list-dhcp|dhcp) list_dhcp_hosts ;;
+	check-client|client-check) check_client "${2:-}" ;;
+	set-socks|set_socks) with_lock set_socks "${2:-}" "${3:-}" ;;
+	set-socks-ref|set_socks_ref) with_lock set_socks_ref "${2:-}" ;;
+	set-client-socks|set_client_socks) with_lock set_client_socks "${2:-}" "${3:-}" "${4:-}" ;;
+	set-client-socks-ref|set_client_socks_ref) with_lock set_client_socks_ref "${2:-}" "${3:-}" ;;
+	clear-client-socks|clear_client_socks) with_lock clear_client_socks "${2:-}" ;;
+	*)
+		printf 'Usage: %s setup|teardown|ready|write-config|socks-list|socks-profiles|set-socks-profile SECTION LABEL HOST PORT|set-socks-ref SECTION|set-socks HOST PORT|test-socks HOST PORT|test-socks-ident HOST PORT|set-client-socks IP HOST PORT|set-client-socks-ref IP SECTION|clear-client-socks IP|health|dhcp-list|check-client IP|add IP|add-named IP LABEL|del IP|delete-client IP|rename IP LABEL|has IP|list\n' "$0" >&2
+		exit 2
+		;;
+esac

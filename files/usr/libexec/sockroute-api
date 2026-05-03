@@ -1,0 +1,508 @@
+#!/bin/sh
+set -eu
+
+CONFIG="sockroute_api"
+SOCKROUTE_CONFIG="sockroute"
+SOCKROUTE_HELPER="/usr/libexec/sockroute"
+SOCKROUTE_INIT="/etc/init.d/sockroute"
+LOCK_FILE="/var/lock/sockroute-api.lock"
+
+log() {
+	logger -t sockroute-api "$*" 2>/dev/null || true
+}
+
+plain_response() {
+	status="$1"
+	body="$2"
+	if [ -n "${GATEWAY_INTERFACE:-}" ]; then
+		case "$status" in
+			200) ;;
+			400) printf 'Status: 400 Bad Request\r\n' ;;
+			403) printf 'Status: 403 Forbidden\r\n' ;;
+			404) printf 'Status: 404 Not Found\r\n' ;;
+			409) printf 'Status: 409 Conflict\r\n' ;;
+			500) printf 'Status: 500 Internal Server Error\r\n' ;;
+			*) printf 'Status: %s\r\n' "$status" ;;
+		esac
+		printf 'Content-Type: text/plain; charset=utf-8\r\n'
+		printf 'Cache-Control: no-store\r\n'
+		printf '\r\n'
+	fi
+	printf '%s\n' "$body"
+}
+
+json_response() {
+	status="$1"
+	ok="$2"
+	device="$3"
+	state="$4"
+	message="$5"
+	ip="${TARGET_IP:-}"
+	if [ -n "${GATEWAY_INTERFACE:-}" ]; then
+		case "$status" in
+			200) ;;
+			400) printf 'Status: 400 Bad Request\r\n' ;;
+			403) printf 'Status: 403 Forbidden\r\n' ;;
+			404) printf 'Status: 404 Not Found\r\n' ;;
+			409) printf 'Status: 409 Conflict\r\n' ;;
+			500) printf 'Status: 500 Internal Server Error\r\n' ;;
+			*) printf 'Status: %s\r\n' "$status" ;;
+		esac
+		printf 'Content-Type: application/json; charset=utf-8\r\n'
+		printf 'Cache-Control: no-store\r\n'
+		printf '\r\n'
+	fi
+	printf '{"ok":%s,"device":"%s","ip":"%s","state":"%s","message":"%s"}\n' "$ok" "$device" "$ip" "$state" "$message"
+}
+
+respond() {
+	status="$1"
+	ok="$2"
+	device="$3"
+	state="$4"
+	message="$5"
+	case "${FORMAT:-plain}" in
+		json) json_response "$status" "$ok" "$device" "$state" "$message" ;;
+		*) plain_response "$status" "$message" ;;
+	esac
+}
+
+die() {
+	status="$1"
+	message="$2"
+	respond "$status" false "${DEVICE:-}" "ERROR" "$message"
+	exit 1
+}
+
+query_value() {
+	key="$1"
+	printf '%s\n' "${QUERY_STRING:-}" | tr '&' '\n' | while IFS='=' read -r k v; do
+		[ "$k" = "$key" ] || continue
+		url_decode "$v"
+		exit 0
+	done
+}
+
+url_decode() {
+	printf '%s' "$1" | awk '
+	BEGIN {
+		for (i = 0; i < 256; i++)
+			hex[sprintf("%02X", i)] = sprintf("%c", i)
+	}
+	{
+		gsub(/\+/, " ")
+		while (match($0, /%[0-9A-Fa-f][0-9A-Fa-f]/)) {
+			code = toupper(substr($0, RSTART + 1, 2))
+			$0 = substr($0, 1, RSTART - 1) hex[code] substr($0, RSTART + 3)
+		}
+		printf "%s", $0
+	}'
+}
+
+validate_name() {
+	value="$1"
+	case "$value" in
+		""|*[!A-Za-z0-9_-]*)
+			return 1
+			;;
+	esac
+	return 0
+}
+
+validate_ip4() {
+	value="$1"
+	case "$value" in
+		""|*[!0-9.]*|*.*.*.*.*|*..*|.*|*.)
+			return 1
+			;;
+	esac
+	old_ifs="$IFS"
+	IFS=.
+	set -- $value
+	IFS="$old_ifs"
+	[ "$#" -eq 4 ] || return 1
+	for octet in "$@"; do
+		case "$octet" in
+			""|*[!0-9]*)
+				return 1
+				;;
+		esac
+		[ "$octet" -ge 0 ] 2>/dev/null && [ "$octet" -le 255 ] || return 1
+	done
+	return 0
+}
+
+validate_port() {
+	value="$1"
+	case "$value" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	[ "$value" -ge 1 ] 2>/dev/null && [ "$value" -le 65535 ] || return 1
+	return 0
+}
+
+ip4_to_int() {
+	value="$1"
+	validate_ip4 "$value" || return 1
+	old_ifs="$IFS"
+	IFS=.
+	set -- $value
+	IFS="$old_ifs"
+	printf '%u' $((($1 << 24) + ($2 << 16) + ($3 << 8) + $4))
+}
+
+validate_cidr4() {
+	value="$1"
+	case "$value" in
+		*/*) ;;
+		*) return 1 ;;
+	esac
+	network="${value%/*}"
+	bits="${value#*/}"
+	validate_ip4 "$network" || return 1
+	case "$bits" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	[ "$bits" -ge 0 ] 2>/dev/null && [ "$bits" -le 32 ] || return 1
+	return 0
+}
+
+ip_in_cidr4() {
+	ip="$1"
+	cidr="$2"
+	validate_ip4 "$ip" || return 1
+	validate_cidr4 "$cidr" || return 1
+
+	network="${cidr%/*}"
+	bits="${cidr#*/}"
+	ip_int="$(ip4_to_int "$ip")" || return 1
+	network_int="$(ip4_to_int "$network")" || return 1
+
+	if [ "$bits" -eq 0 ]; then
+		mask=0
+	else
+		mask=$(((0xffffffff << (32 - bits)) & 0xffffffff))
+	fi
+
+	[ $((ip_int & mask)) -eq $((network_int & mask)) ]
+}
+
+ip_token() {
+	printf '%s' "$1" | tr '.' '_'
+}
+
+legacy_prefix_to_cidr() {
+	prefix="$1"
+	case "$prefix" in
+		*.*.*.)
+			a="${prefix%%.*}"
+			rest="${prefix#*.}"
+			b="${rest%%.*}"
+			rest="${rest#*.}"
+			c="${rest%%.*}"
+			validate_ip4 "$a.$b.$c.0" || return 1
+			printf '%s.%s.%s.0/24' "$a" "$b" "$c"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+target_cidr() {
+	cidr="$(uci -q get "$CONFIG.main.allowed_target_cidr" 2>/dev/null || true)"
+	if validate_cidr4 "$cidr"; then
+		printf '%s' "$cidr"
+		return 0
+	fi
+
+	prefix="$(uci -q get "$CONFIG.main.allowed_target_prefix" 2>/dev/null || true)"
+	if [ -n "$prefix" ]; then
+		legacy_prefix_to_cidr "$prefix" && return 0
+	fi
+
+	printf '192.168.1.0/24'
+}
+
+target_ip_allowed() {
+	target_ip="$1"
+	cidr="$(target_cidr)"
+	ip_in_cidr4 "$target_ip" "$cidr" || return 1
+	host="${target_ip##*.}"
+	[ "$host" -ge 1 ] 2>/dev/null && [ "$host" -le 254 ] || return 1
+	return 0
+}
+
+allowed_sources() {
+	uci -q get "$CONFIG.main.allowed_source_ip" 2>/dev/null || printf '192.168.1.2'
+}
+
+check_cgi_access() {
+	[ -n "${GATEWAY_INTERFACE:-}" ] || return 0
+
+	remote="${REMOTE_ADDR:-}"
+	[ -n "$remote" ] || die 403 "FORBIDDEN"
+
+	for allowed in $(allowed_sources); do
+		if [ "$remote" = "$allowed" ]; then
+			return 0
+		fi
+	done
+	log "rejected remote address: $remote"
+	die 403 "FORBIDDEN"
+}
+
+check_token() {
+	token_expected="$(uci -q get "$CONFIG.main.token" 2>/dev/null || true)"
+	[ -n "$token_expected" ] || return 0
+
+	token_actual="${TOKEN:-}"
+	[ -n "$token_actual" ] || token_actual="${HTTP_X_SOCKROUTE_TOKEN:-}"
+	if [ "$token_actual" != "$token_expected" ]; then
+		log "bad token for ${DEVICE:-unknown}"
+		die 403 "FORBIDDEN"
+	fi
+}
+
+find_device_by_ip() {
+	search_ip="$1"
+	for section in $(uci show "$CONFIG" 2>/dev/null | sed -n "s/^$CONFIG\.\([^.]*\)=vpn_device$/\1/p"); do
+		if [ "$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)" = "$search_ip" ]; then
+			printf '%s' "$section"
+			return 0
+		fi
+	done
+	return 1
+}
+
+resolve_target() {
+	if [ -n "${TARGET_IP:-}" ]; then
+		validate_ip4 "$TARGET_IP" || die 400 "ERROR: bad ip"
+		target_ip_allowed "$TARGET_IP" || die 403 "ERROR: target ip is not allowed"
+		found_device="$(find_device_by_ip "$TARGET_IP" || true)"
+		if [ -n "$found_device" ]; then
+			DEVICE="$found_device"
+			DEVICE_MODE="configured"
+		else
+			DEVICE="${DEVICE:-ip_$(ip_token "$TARGET_IP")}"
+			validate_name "$DEVICE" || die 400 "ERROR: bad device"
+			DEVICE_MODE="dynamic"
+		fi
+		return 0
+	fi
+
+	DEVICE="${DEVICE:-sigma}"
+	validate_name "$DEVICE" || die 400 "ERROR: bad device"
+	uci -q get "$CONFIG.$DEVICE" >/dev/null 2>&1 || die 404 "ERROR: unknown device"
+	TARGET_IP="$(uci -q get "$CONFIG.$DEVICE.ip" 2>/dev/null || true)"
+	validate_ip4 "$TARGET_IP" || die 400 "ERROR: bad device ip"
+	target_ip_allowed "$TARGET_IP" || die 403 "ERROR: target ip is not allowed"
+	DEVICE_MODE="configured"
+}
+
+device_ip() {
+	printf '%s' "${TARGET_IP:-}"
+}
+
+device_label() {
+	if [ "${DEVICE_MODE:-}" = "configured" ]; then
+		uci -q get "$CONFIG.$DEVICE.label" 2>/dev/null || printf '%s' "$DEVICE"
+	else
+		printf '%s' "$TARGET_IP"
+	fi
+}
+
+api_backend() {
+	uci -q get "$CONFIG.main.backend" 2>/dev/null || printf 'sockroute'
+}
+
+with_lock() {
+	mkdir -p "$(dirname "$LOCK_FILE")"
+	exec 9>"$LOCK_FILE"
+	if ! flock -x 9; then
+		die 409 "ERROR: lock failed"
+	fi
+	"$@"
+}
+
+sockroute_ensure() {
+	[ -x "$SOCKROUTE_HELPER" ] || die 500 "ERROR: SockRoute helper not installed"
+	[ -x "$SOCKROUTE_INIT" ] || die 500 "ERROR: SockRoute init script not installed"
+
+	if ! "$SOCKROUTE_INIT" running >/dev/null 2>&1; then
+		if ! "$SOCKROUTE_INIT" start >/dev/null 2>&1; then
+			die 500 "ERROR: SockRoute service start failed"
+		fi
+	fi
+	if ! "$SOCKROUTE_HELPER" ready >/dev/null 2>&1 && ! "$SOCKROUTE_HELPER" setup >/dev/null 2>&1; then
+		die 500 "ERROR: SockRoute nft setup failed"
+	fi
+}
+
+socks_profile_sections() {
+	uci show "$SOCKROUTE_CONFIG" 2>/dev/null | sed -n "s/^$SOCKROUTE_CONFIG\.\([^.]*\)=socks$/\1/p"
+}
+
+socks_profile_exists() {
+	[ -n "${1:-}" ] && [ "$(uci -q get "$SOCKROUTE_CONFIG.$1" 2>/dev/null || true)" = "socks" ]
+}
+
+resolve_outbound_ref() {
+	outbound="${OUTBOUND:-}"
+	[ -n "$outbound" ] || return 1
+
+	case "$outbound" in
+		default|DEFAULT|main|MAIN|auto|AUTO|-)
+			printf 'default'
+			return 0
+			;;
+	esac
+
+	if socks_profile_exists "$outbound"; then
+		printf '%s' "$outbound"
+		return 0
+	fi
+
+	for section in $(socks_profile_sections); do
+		label="$(uci -q get "$SOCKROUTE_CONFIG.$section.label" 2>/dev/null || true)"
+		host="$(uci -q get "$SOCKROUTE_CONFIG.$section.host" 2>/dev/null || true)"
+		port="$(uci -q get "$SOCKROUTE_CONFIG.$section.port" 2>/dev/null || true)"
+		if [ "$label" = "$outbound" ] || [ "$host:$port" = "$outbound" ]; then
+			printf '%s' "$section"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+sockroute_apply_outbound() {
+	[ -n "${OUTBOUND:-}" ] || return 0
+
+	ref="$(resolve_outbound_ref || true)"
+	[ -n "$ref" ] || die 400 "ERROR: bad outbound"
+
+	if [ "$ref" = "default" ]; then
+		if ! "$SOCKROUTE_HELPER" clear-client-socks "$TARGET_IP" >/dev/null 2>&1; then
+			die 500 "ERROR: SockRoute clear outbound failed"
+		fi
+	else
+		if ! "$SOCKROUTE_HELPER" rename "$TARGET_IP" "$(device_label)" >/dev/null 2>&1; then
+			die 500 "ERROR: SockRoute client profile update failed"
+		fi
+		if ! "$SOCKROUTE_HELPER" set-client-socks-ref "$TARGET_IP" "$ref" >/dev/null 2>&1; then
+			die 500 "ERROR: SockRoute set outbound failed"
+		fi
+	fi
+
+	if ! "$SOCKROUTE_INIT" restart >/dev/null 2>&1; then
+		die 500 "ERROR: SockRoute restart failed"
+	fi
+	log "updated SockRoute outbound for $DEVICE $TARGET_IP to $OUTBOUND"
+}
+
+sockroute_status() {
+	[ -x "$SOCKROUTE_HELPER" ] || die 500 "ERROR: SockRoute helper not installed"
+	if "$SOCKROUTE_HELPER" has "$TARGET_IP" >/dev/null 2>&1; then
+		respond 200 true "$DEVICE" "ON" "ON"
+	else
+		respond 200 true "$DEVICE" "OFF" "OFF"
+	fi
+}
+
+sockroute_on_impl() {
+	sockroute_ensure
+	sockroute_apply_outbound
+	if ! "$SOCKROUTE_HELPER" add "$TARGET_IP" >/dev/null 2>&1; then
+		die 500 "ERROR: SockRoute enable failed"
+	fi
+	log "enabled SockRoute set for $DEVICE $TARGET_IP"
+	respond 200 true "$DEVICE" "ON" "ON"
+}
+
+sockroute_off_impl() {
+	if ! "$SOCKROUTE_HELPER" del "$TARGET_IP" >/dev/null 2>&1; then
+		die 500 "ERROR: SockRoute disable failed"
+	fi
+	log "disabled SockRoute set for $DEVICE $TARGET_IP"
+	respond 200 true "$DEVICE" "OFF" "OFF"
+}
+
+sockroute_toggle_impl() {
+	if "$SOCKROUTE_HELPER" has "$TARGET_IP" >/dev/null 2>&1; then
+		sockroute_off_impl
+	else
+		sockroute_on_impl
+	fi
+}
+
+handle_request() {
+	resolve_target
+
+	case "$(api_backend)" in
+		sockroute)
+			case "$ACTION" in
+				status) sockroute_status ;;
+				on) with_lock sockroute_on_impl ;;
+				off) with_lock sockroute_off_impl ;;
+				toggle) with_lock sockroute_toggle_impl ;;
+				*) die 400 "ERROR: bad action" ;;
+			esac
+			return 0
+			;;
+		*) die 500 "ERROR: bad backend" ;;
+	esac
+}
+
+cgi_main() {
+	DEVICE="$(query_value device)"
+	TARGET_IP="$(query_value ip)"
+	ACTION="$(query_value action)"
+	OUTBOUND="$(query_value outbound)"
+	[ -n "$OUTBOUND" ] || OUTBOUND="$(query_value socks)"
+	TOKEN="$(query_value token)"
+	FORMAT="$(query_value format)"
+	APPLY="$(query_value apply)"
+	DEVICE="${DEVICE:-sigma}"
+	ACTION="${ACTION:-status}"
+	FORMAT="${FORMAT:-plain}"
+	check_cgi_access
+	check_token
+	handle_request
+}
+
+cli_main() {
+	case "${1:-}" in
+		vpn)
+			DEVICE=""
+			TARGET_IP=""
+			case "${2:-sigma}" in
+				*.*.*.*) TARGET_IP="$2" ;;
+				*) DEVICE="${2:-sigma}" ;;
+			esac
+			ACTION="${3:-status}"
+			OUTBOUND="${4:-}"
+			FORMAT="${FORMAT:-plain}"
+			APPLY="${5:-}"
+			;;
+		*)
+			DEVICE=""
+			TARGET_IP=""
+			case "${1:-sigma}" in
+				*.*.*.*) TARGET_IP="$1" ;;
+				*) DEVICE="${1:-sigma}" ;;
+			esac
+			ACTION="${2:-status}"
+			OUTBOUND="${3:-}"
+			FORMAT="${FORMAT:-plain}"
+			APPLY="${4:-}"
+			;;
+	esac
+	handle_request
+}
+
+if [ -n "${GATEWAY_INTERFACE:-}" ]; then
+	cgi_main
+else
+	cli_main "$@"
+fi

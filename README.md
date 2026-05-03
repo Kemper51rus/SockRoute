@@ -1,8 +1,8 @@
 # SockRoute
 
-<img src="preview.png" alt="SockRoute LuCI web service preview" width="100%">
-
 SockRoute - это веб-сервис для LuCI на OpenWrt, который позволяет вручную отправлять выбранных LAN-клиентов в выбранный SOCKS outbound без перезапуска основного прокси-стека.
+
+<img src="preview.png" alt="SockRoute LuCI web service preview" width="100%">
 
 Проект устанавливает:
 

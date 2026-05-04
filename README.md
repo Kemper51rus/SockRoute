@@ -34,7 +34,7 @@ wget -O - https://raw.githubusercontent.com/Kemper51rus/SockRoute/main/install.s
 - делает бэкап существующих файлов SockRoute в `/root/sockroute-backups/<timestamp>`;
 - устанавливает службу, API и LuCI-файлы;
 - создаёт `/etc/config/sockroute` и `/etc/config/sockroute_api`, если их ещё нет;
-- использует hook-цепочки PassWall2, если они есть, иначе подключается к стандартным цепочкам `fw4`;
+- использует найденные nft hook-цепочки, по умолчанию стандартные цепочки `fw4`;
 - включает и запускает `/etc/init.d/sockroute`;
 - чистит LuCI cache и перезапускает `rpcd`/`uhttpd`.
 
@@ -43,9 +43,7 @@ wget -O - https://raw.githubusercontent.com/Kemper51rus/SockRoute/main/install.s
 - OpenWrt с nftables/firewall4.
 - `sing-box`.
 - Доступный SOCKS5 endpoint. Он может быть локальным, например `127.0.0.1:1080`, или находиться на другом устройстве в LAN.
-- nft hook-цепочки:
-  - предпочтительно: `inet passwall2 PSW2_NAT` и `inet passwall2 PSW2_MANGLE`;
-  - запасной вариант: `inet fw4 dstnat` и `inet fw4 mangle_prerouting`.
+- nft hook-цепочки. На обычном firewall4 это `inet fw4 dstnat` и `inet fw4 mangle_prerouting`.
 
 ## Настройка
 

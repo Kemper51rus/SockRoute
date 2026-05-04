@@ -85,12 +85,12 @@ with_lock() {
 }
 
 family() { cfg nft_family inet; }
-table() { cfg nft_table passwall2; }
+table() { cfg nft_table fw4; }
 set_name() { cfg nft_set sockroute_clients; }
 nat_chain() { cfg nft_nat_chain SOCKROUTE_NAT; }
 mangle_chain() { cfg nft_mangle_chain SOCKROUTE_MANGLE; }
-nat_hook_chain() { cfg nft_nat_hook_chain PSW2_NAT; }
-mangle_hook_chain() { cfg nft_mangle_hook_chain PSW2_MANGLE; }
+nat_hook_chain() { cfg nft_nat_hook_chain dstnat; }
+mangle_hook_chain() { cfg nft_mangle_hook_chain mangle_prerouting; }
 lan_if() { cfg lan_if br-lan; }
 lan_cidr() { cfg lan_cidr 192.168.1.0/24; }
 listen_port() { cfg listen_port 1042; }
@@ -1004,9 +1004,9 @@ list_health() {
 
 	if nft list set "$fam" "$tbl" "$set" >/dev/null 2>&1; then
 		count="$(nft list set "$fam" "$tbl" "$set" 2>/dev/null | sed -n 's/.*elements = { \(.*\) }.*/\1/p' | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
-		health_line nft-set ok "$fam $tbl $set, elements: ${count:-0}"
+		health_line nft-set ok "set $set, elements: ${count:-0}"
 	else
-		health_line nft-set fail "$fam $tbl $set не найден"
+		health_line nft-set fail "set $set не найден"
 	fi
 
 	if nft list chain "$fam" "$tbl" "$nat" >/dev/null 2>&1; then

@@ -125,10 +125,10 @@ LuCI-страница сначала открывается по лёгким д
 
 Действия LuCI-страницы не вызывают полную перезагрузку браузера. После добавления, удаления, редактирования клиента, изменения default SOCKS, сохранения API или обслуживания SockRoute страница заново читает `sockroute`, `sockroute_api` и runtime-данные, затем мягко заменяет содержимое `#sockroute-root`; открытые раскрывающиеся блоки сохраняют своё состояние.
 
-`socks-list` не хранит подписи вручную. Если на роутере установлен PassWall2, helper читает его UCI и runtime-файлы `/tmp/etc/passwall2/*.json`, поэтому источник SOCKS показывается по фактическому состоянию роутера. Типичные варианты:
+`socks-list` не хранит подписи вручную. Helper читает поддерживаемые UCI/runtime-файлы proxy stack, поэтому источник SOCKS показывается по фактическому состоянию роутера. Типичные варианты:
 
-- `127.0.0.1:1070` - основной routing SOCKS PassWall2 (`passwall2.@global[0].node`), например `rulenode -> xhttp-router`; он проходит через geo/shunt-правила.
-- `127.0.0.1:1081` - отдельный SOCKS inbound из UCI-секции PassWall2, привязанный к конкретному node; listener может быть открыт на `0.0.0.0`.
+- routing SOCKS основного proxy stack: может проходить через его geo/shunt-правила;
+- отдельный SOCKS inbound из UCI: может быть привязан к конкретной proxy-node и слушать не только localhost;
 - `127.0.0.1:1080` - локальный SOCKS endpoint по умолчанию для чистой установки.
 
 Счётчики:
@@ -179,8 +179,12 @@ logread -e sockroute-api
 /usr/libexec/sockroute check-client 192.168.1.100
 /usr/libexec/sockroute socks-list
 nft list set inet fw4 sockroute_clients
-nft -a list chain inet passwall2 PSW2_NAT | grep 'sockroute'
-nft -a list chain inet passwall2 PSW2_MANGLE | grep 'sockroute'
 ```
 
-`passwall2` в последних командах - это имя nft table/hook chains текущего роутера, а не требование использовать конкретный SOCKS outbound.
+Если SockRoute подключён не к стандартной `fw4` table, текущие nft table/hook chains можно посмотреть так:
+
+```sh
+uci -q get sockroute.main.nft_table
+uci -q get sockroute.main.nft_nat_hook_chain
+uci -q get sockroute.main.nft_mangle_hook_chain
+```

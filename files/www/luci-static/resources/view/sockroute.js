@@ -15,12 +15,6 @@ function asList(value) {
 	return [];
 }
 
-function splitList(value) {
-	return String(value || '').split(/[\s,;]+/).filter(function(item) {
-		return item.length > 0;
-	});
-}
-
 function validateIp4(value) {
 	var parts = String(value || '').trim().split('.');
 
@@ -37,6 +31,12 @@ function validateIp4(value) {
 	}
 
 	return true;
+}
+
+function splitList(value) {
+	return String(value || '').split(/[\s,;]+/).filter(function(item) {
+		return item.length > 0;
+	});
 }
 
 function validateCidr4(value) {
@@ -56,6 +56,105 @@ function validatePort(value) {
 
 	var port = Number(value);
 	return port >= 1 && port <= 65535;
+}
+
+function validateIntervalSeconds(value) {
+	if (!/^[0-9]+$/.test(String(value || '').trim()))
+		return false;
+
+	var seconds = Number(value);
+	return seconds >= 5 && seconds <= 3600;
+}
+
+function intervalSeconds(value, fallback) {
+	return validateIntervalSeconds(value) ? Number(value) : fallback;
+}
+
+function validateHostname(value) {
+	return /^[A-Za-z0-9.-]+$/.test(String(value || '')) && String(value || '').indexOf('.') > 0;
+}
+
+function validateDnsServerSpec(value) {
+	var spec = String(value || '').trim();
+	var proto = 'udp';
+	var server = spec;
+	var port = '';
+	var slash;
+
+	if (!spec)
+		return false;
+	if (server.indexOf('udp://') === 0)
+		server = server.substr(6);
+	else if (server.indexOf('tls://') === 0) {
+		proto = 'tls';
+		server = server.substr(6);
+	}
+	else if (server.indexOf('https://') === 0) {
+		proto = 'https';
+		server = server.substr(8);
+	}
+	else if (server.indexOf('://') >= 0)
+		return false;
+
+	if (proto === 'https') {
+		slash = server.indexOf('/');
+		if (slash >= 0)
+			server = server.substr(0, slash);
+	}
+	if (server.indexOf(':') >= 0) {
+		port = server.split(':').pop();
+		server = server.substr(0, server.length - port.length - 1);
+	}
+	return (validateIp4(server) || validateHostname(server)) && (!port || validatePort(port));
+}
+
+function dnsProfilesFromUci() {
+	var profiles = uci.sections('sockroute', 'dns').map(function(section) {
+		return {
+			section: sectionId(section),
+			ref: sectionId(section),
+			label: section.label || sectionId(section),
+			server: section.server || '',
+			lastCheck: section.last_check || 'unknown',
+			lastCheckDetail: section.last_check_detail || '',
+			lastCheckTime: section.last_check_time || ''
+		};
+	}).filter(function(profile) {
+		return profile.section && validateDnsServerSpec(profile.server);
+	}).sort(function(a, b) {
+		return String(a.label).localeCompare(String(b.label));
+	});
+
+	if (!profiles.length) {
+		profiles.push({
+			section: 'standard',
+			ref: 'standard',
+			label: uci.get('sockroute', 'main', 'dns_standard_label') || 'DNS standard',
+			server: uci.get('sockroute', 'main', 'dns_standard_server') || 'udp://100.100.0.217',
+			lastCheck: 'unknown',
+			lastCheckDetail: '',
+			lastCheckTime: ''
+		});
+		profiles.push({
+			section: 'unblock',
+			ref: 'unblock',
+			label: uci.get('sockroute', 'main', 'dns_unblock_label') || 'DNS unblock',
+			server: uci.get('sockroute', 'main', 'dns_unblock_server') || 'udp://100.100.0.156',
+			lastCheck: 'unknown',
+			lastCheckDetail: '',
+			lastCheckTime: ''
+		});
+	}
+
+	return profiles;
+}
+
+function dnsProfileByRef(profiles, ref) {
+	for (var i = 0; i < (profiles || []).length; i++) {
+		if (profiles[i].ref === ref)
+			return profiles[i];
+	}
+	return null;
 }
 
 function parseSocksCandidates(value) {
@@ -135,6 +234,92 @@ function endpointFromValue(value, profiles) {
 	return null;
 }
 
+function endpointFromText(value) {
+	var text = String(value || '').trim();
+	var parts;
+
+	if (!text)
+		return null;
+
+	if (text.indexOf('|') >= 0)
+		return endpointFromValue(text);
+
+	parts = text.split(':');
+	if (parts.length === 2)
+		return { host: parts[0], port: parts[1] };
+
+	return null;
+}
+
+function syncSocksEndpointInput(endpointId, hostId, portId, warnings, labels) {
+	var endpointInput = document.getElementById(endpointId);
+	var hostInput = document.getElementById(hostId);
+	var portInput = document.getElementById(portId);
+	var labelInput = document.getElementById('sockroute-socks-label');
+	var value = endpointInput ? endpointInput.value.trim() : '';
+	var endpoint = endpointFromText(value);
+
+	if (!endpoint) {
+		if (hostInput)
+			hostInput.value = '';
+		if (portInput)
+			portInput.value = '';
+		updateSocksWarning(null);
+		return false;
+	}
+
+	if (hostInput)
+		hostInput.value = endpoint.host;
+	if (portInput)
+		portInput.value = endpoint.port;
+
+	updateSocksWarning(value && warnings ? warnings[value] : null);
+	if (labelInput && !labelInput.value.trim() && labels && labels[value])
+		labelInput.value = labels[value];
+
+	return true;
+}
+
+function showSocksEndpointMenu(menuId) {
+	var menu = document.getElementById(menuId);
+	if (menu)
+		menu.style.display = 'block';
+}
+
+function hideSocksEndpointMenu(menuId) {
+	var menu = document.getElementById(menuId);
+	if (menu)
+		window.setTimeout(function() {
+			menu.style.display = 'none';
+		}, 120);
+}
+
+function filterSocksEndpointMenu(menuId, query) {
+	var menu = document.getElementById(menuId);
+	var needle = String(query || '').toLowerCase();
+	var children;
+
+	if (!menu)
+		return;
+
+	children = menu.children || [];
+	for (var i = 0; i < children.length; i++) {
+		var haystack = String(children[i].getAttribute('data-search') || '').toLowerCase();
+		children[i].style.display = !needle || haystack.indexOf(needle) >= 0 ? 'block' : 'none';
+	}
+}
+
+function chooseSocksEndpoint(endpointId, menuId, value, warnings, labels) {
+	var input = document.getElementById(endpointId);
+	if (input) {
+		input.value = value;
+		syncSocksEndpointInput(endpointId, 'sockroute-socks-host', 'sockroute-socks-port', warnings || {}, labels || {});
+	}
+	var menu = document.getElementById(menuId);
+	if (menu)
+		menu.style.display = 'none';
+}
+
 function fillSocksInputIds(value, hostId, portId, profiles) {
 	var endpoint = endpointFromValue(value, profiles);
 	var parts = String(value || '').split('|');
@@ -159,8 +344,16 @@ function fillSocksInputIds(value, hostId, portId, profiles) {
 }
 
 function fillSocksInputs(value) {
-	if (!value)
+	var hostInput = document.getElementById('sockroute-socks-host');
+	var portInput = document.getElementById('sockroute-socks-port');
+
+	if (!value) {
+		if (hostInput)
+			hostInput.value = '';
+		if (portInput)
+			portInput.value = '';
 		return;
+	}
 
 	fillSocksInputIds(value, 'sockroute-socks-host', 'sockroute-socks-port');
 }
@@ -463,8 +656,9 @@ function buildApiExamplesText(clients, socksProfiles, root, token) {
 function buildApiExamplesTable(clients, socksProfiles, root, token) {
 	var source = clients.length ? clients : [ { ip: '192.168.1.100', label: 'Client' } ];
 	var actions = apiExampleActions(socksProfiles);
+	var rowIndex = 0;
 	var rows = [
-		E('tr', { 'class': 'tr table-titles' }, [
+		E('tr', stripedHeaderAttrs(), [
 			E('th', {}, [ 'Клиент' ]),
 			E('th', {}, [ 'IP' ]),
 			E('th', {}, [ 'Действие' ]),
@@ -479,7 +673,7 @@ function buildApiExamplesTable(clients, socksProfiles, root, token) {
 
 		actions.forEach(function(action) {
 			var url = apiUrl(root, ip, action.action, token, action.extra);
-			rows.push(E('tr', {}, [
+			rows.push(E('tr', stripedRowAttrs(rowIndex++), [
 				E('td', {}, [ label ]),
 				E('td', {}, [ ip ]),
 				E('td', {}, [ action.label ]),
@@ -499,7 +693,7 @@ function buildApiExamplesTable(clients, socksProfiles, root, token) {
 	});
 
 	return E('div', { 'style': 'max-height: 360px; overflow: auto;' }, [
-		E('table', { 'class': 'table' }, rows)
+		E('table', dataTableAttrs(), rows)
 	]);
 }
 
@@ -514,7 +708,7 @@ function buildApiHelpText(clients, socksProfiles, root, token) {
 		apiUrl(root, client.ip, 'off', token),
 		apiUrl(root, client.ip, 'toggle', token),
 		'',
-		'Включить клиента и назначить SOCKS outbound:',
+		'Включить клиента и назначить исходящий SOCKS:',
 		apiUrl(root, client.ip, 'on', token, { outbound: outbound }),
 		profile ? apiUrl(root, client.ip, 'on', token, { outbound: profile.section }) : apiUrl(root, client.ip, 'on', token, { outbound: 'socks_192_168_1_10_1080' }),
 		profile ? apiUrl(root, client.ip, 'on', token, { outbound: '%s:%s'.format(profile.host, profile.port) }) : apiUrl(root, client.ip, 'on', token, { outbound: '192.168.1.10:1080' }),
@@ -627,6 +821,15 @@ function socksProfileCheckTitle(profile) {
 	return detail;
 }
 
+function dnsProfileCheckTitle(profile) {
+	var detail = profile.lastCheckDetail || 'нет сохранённой проверки DNS';
+
+	if (profile.lastCheckTime)
+		detail += ' / ' + profile.lastCheckTime;
+
+	return detail;
+}
+
 function clientCountText(count) {
 	var mod10 = count % 10;
 	var mod100 = count % 100;
@@ -640,18 +843,38 @@ function clientCountText(count) {
 	return count + ' клиентов';
 }
 
+function dataTableAttrs(extraClass) {
+	return {
+		'class': ('table' + (extraClass ? ' ' + extraClass : '')),
+		'style': 'width:100%; border-collapse:separate; border-spacing:0 3px;'
+	};
+}
+
+function stripedHeaderAttrs() {
+	return {
+		'class': 'tr table-titles',
+		'style': 'background:rgba(127,127,127,.16);'
+	};
+}
+
+function stripedRowAttrs(index, extraStyle) {
+	return {
+		'style': 'background:%s;%s'.format(index % 2 ? 'rgba(127,127,127,.08)' : 'rgba(127,127,127,.03)', extraStyle || '')
+	};
+}
+
 function buildHealthTable(rows) {
 	if (!rows.length)
 		return E('em', {}, [ 'Нет данных диагностики.' ]);
 
-	return E('table', { 'class': 'table' }, [
-		E('tr', { 'class': 'tr table-titles' }, [
+	return E('table', dataTableAttrs(), [
+		E('tr', stripedHeaderAttrs(), [
 			E('th', {}, [ 'Проверка' ]),
 			E('th', {}, [ 'Статус' ]),
 			E('th', {}, [ 'Детали' ])
 		])
-	].concat(rows.map(function(row) {
-		return E('tr', {}, [
+	].concat(rows.map(function(row, index) {
+		return E('tr', stripedRowAttrs(index), [
 			E('td', {}, [ row.name ]),
 			E('td', {}, [ statusBadge(row.status) ]),
 			E('td', {}, [ row.detail ])
@@ -682,6 +905,35 @@ function mergedHealthCard(rows, names) {
 	}
 
 	return { status: status, detail: detail.join(' / ') };
+}
+
+function aggregateProfilesStatus(profiles, label) {
+	var status = 'unknown';
+	var ok = 0;
+	var fail = 0;
+	var warn = 0;
+
+	if (!(profiles || []).length)
+		return { status: 'unknown', detail: 'нет профилей' };
+
+	(profiles || []).forEach(function(profile) {
+		var check = profile.lastCheck || 'unknown';
+		if (check === 'ok')
+			ok++;
+		else if (check === 'fail')
+			fail++;
+		else if (check === 'warn')
+			warn++;
+	});
+
+	if (fail)
+		status = 'fail';
+	else if (warn)
+		status = 'warn';
+	else if (ok === profiles.length)
+		status = 'ok';
+
+	return { status: status, detail: '%s: OK %d / FAIL %d / WARN %d / всего %d'.format(label, ok, fail, warn, profiles.length) };
 }
 
 function updateStatusCard(key, status, detail) {
@@ -729,6 +981,7 @@ function refreshSocksProfileIdent(profile) {
 			status === 'ok' ? identIpFromDetail(detail) : 'FAIL',
 			'%s / обновлено %s'.format(detail, currentClock())
 		);
+		return status;
 	});
 }
 
@@ -748,14 +1001,75 @@ function refreshSocksProfilesInBackground(profiles) {
 
 	(profiles || []).forEach(function(profile) {
 		sequence = sequence.then(function() {
-			return refreshSocksProfileIdent(profile);
+			return refreshSocksProfileIdent(profile).then(function(status) {
+				profile.lastCheck = status;
+			});
 		});
 	});
 
 	return sequence.then(function() {
+		var aggregate = aggregateProfilesStatus(profiles || [], 'SOCKS');
+		updateStatusCard('socks', aggregate.status, aggregate.detail);
 		window.sockrouteSocksRefreshBusy = false;
 	}, function(err) {
 		window.sockrouteSocksRefreshBusy = false;
+		throw err;
+	});
+}
+
+function refreshDnsProfileInBackground(profile) {
+	var key = domId(profile.section);
+
+	setStatusBadge('sockroute-dns-status-%s'.format(key), 'warn');
+	setNodeText('sockroute-dns-detail-%s'.format(key), 'проверка...', 'Проверка DNS выполняется в фоне');
+
+	return L.resolveDefault(fs.exec(helperPath, [ 'test-dns-profile', profile.section ]), {
+		code: 1,
+		stdout: '',
+		stderr: 'ошибка запуска проверки'
+	}).then(function(res) {
+		var rows = parseHealth(res.stdout || '');
+		var row = healthRowByName(rows, 'dns');
+		var detail = row.detail || res.stderr || 'нет вывода';
+		var status = row.status === 'ok' ? 'ok' : 'fail';
+
+		if (!rows.length)
+			detail = res.stderr || 'нет вывода';
+
+		setStatusBadge('sockroute-dns-status-%s'.format(key), status);
+		setNodeText('sockroute-dns-detail-%s'.format(key), status === 'ok' ? 'OK' : 'FAIL', '%s / обновлено %s'.format(detail, currentClock()));
+		return status;
+	});
+}
+
+function refreshDnsProfilesInBackground(profiles) {
+	var sequence = Promise.resolve();
+
+	if (!document.getElementById('sockroute-root')) {
+		if (window.sockrouteDnsRefreshTimer)
+			window.clearInterval(window.sockrouteDnsRefreshTimer);
+		return Promise.resolve();
+	}
+
+	if (window.sockrouteDnsRefreshBusy)
+		return Promise.resolve();
+
+	window.sockrouteDnsRefreshBusy = true;
+
+	(profiles || []).forEach(function(profile) {
+		sequence = sequence.then(function() {
+			return refreshDnsProfileInBackground(profile).then(function(status) {
+				profile.lastCheck = status;
+			});
+		});
+	});
+
+	return sequence.then(function() {
+		var aggregate = aggregateProfilesStatus(profiles || [], 'DNS');
+		updateStatusCard('dns', aggregate.status, aggregate.detail);
+		window.sockrouteDnsRefreshBusy = false;
+	}, function(err) {
+		window.sockrouteDnsRefreshBusy = false;
 		throw err;
 	});
 }
@@ -861,7 +1175,7 @@ function refreshClientTrafficInBackground(clients) {
 	});
 }
 
-function scheduleBackgroundChecks(profiles, clients) {
+function scheduleBackgroundChecks(profiles, dnsProfiles, clients, socksInterval, dnsInterval, checkLoop) {
 	var snapshot = (profiles || []).map(function(profile) {
 		return {
 			section: profile.section,
@@ -870,9 +1184,18 @@ function scheduleBackgroundChecks(profiles, clients) {
 			port: profile.port
 		};
 	});
+	var dnsSnapshot = (dnsProfiles || []).map(function(profile) {
+		return {
+			section: profile.section,
+			label: profile.label,
+			server: profile.server
+		};
+	});
 	var clientSnapshot = (clients || []).map(function(client) {
 		return { ip: client.ip };
 	});
+	var socksIntervalMs = intervalSeconds(socksInterval, 30) * 1000;
+	var dnsIntervalMs = intervalSeconds(dnsInterval, 30) * 1000;
 
 	if (window.sockrouteSocksRefreshTimer)
 		window.clearInterval(window.sockrouteSocksRefreshTimer);
@@ -880,6 +1203,10 @@ function scheduleBackgroundChecks(profiles, clients) {
 		window.clearInterval(window.sockrouteTrafficRefreshTimer);
 	if (window.sockrouteSocksRefreshDelay)
 		window.clearTimeout(window.sockrouteSocksRefreshDelay);
+	if (window.sockrouteDnsRefreshTimer)
+		window.clearInterval(window.sockrouteDnsRefreshTimer);
+	if (window.sockrouteDnsRefreshDelay)
+		window.clearTimeout(window.sockrouteDnsRefreshDelay);
 	if (window.sockrouteTrafficRefreshDelay)
 		window.clearTimeout(window.sockrouteTrafficRefreshDelay);
 	if (window.sockrouteHealthRefreshDelay)
@@ -895,21 +1222,31 @@ function scheduleBackgroundChecks(profiles, clients) {
 		}, 5000);
 	}
 
-	if (!snapshot.length)
-		return;
+	if (snapshot.length) {
+		window.sockrouteSocksRefreshDelay = window.setTimeout(function() {
+			refreshSocksProfilesInBackground(snapshot);
+		}, 1200);
+		if (checkLoop) {
+			window.sockrouteSocksRefreshTimer = window.setInterval(function() {
+				refreshSocksProfilesInBackground(snapshot);
+			}, socksIntervalMs);
+		}
+	}
 
-	window.sockrouteSocksRefreshDelay = window.setTimeout(function() {
-		refreshSocksProfilesInBackground(snapshot);
-	}, 1200);
-	window.sockrouteSocksRefreshTimer = window.setInterval(function() {
-		refreshSocksProfilesInBackground(snapshot);
-	}, 30000);
+	if (dnsSnapshot.length) {
+		window.sockrouteDnsRefreshDelay = window.setTimeout(function() {
+			refreshDnsProfilesInBackground(dnsSnapshot);
+		}, 1600);
+		if (checkLoop) {
+			window.sockrouteDnsRefreshTimer = window.setInterval(function() {
+				refreshDnsProfilesInBackground(dnsSnapshot);
+			}, dnsIntervalMs);
+		}
+	}
 }
 
 function scheduleDeferredDataLoad(viewObject) {
 	if (!viewObject || viewObject.deferredDataLoaded || viewObject.deferredDataBusy)
-		return;
-	if (!document.getElementById('sockroute-root'))
 		return;
 	if (window.sockrouteDeferredDataDelay)
 		window.clearTimeout(window.sockrouteDeferredDataDelay);
@@ -940,6 +1277,70 @@ function buildStatusSummary(cards) {
 			}, [ card.detail || '-' ])
 		]);
 	}));
+}
+
+function buildDefaultDnsSection(viewObject, defaultDnsServer, dnsProfiles) {
+	var standard = dnsProfileByRef(dnsProfiles, 'standard') || { server: 'udp://100.100.0.217' };
+	var unblock = dnsProfileByRef(dnsProfiles, 'unblock') || { server: 'udp://100.100.0.156' };
+
+	return E('div', { 'class': 'cbi-section' }, [
+		E('h3', {}, [ 'DNS профили' ]),
+		E('div', { 'class': 'cbi-section-descr' }, [
+			'Адреса DNS, которые можно выбрать для клиента прямо в таблице. DNS по умолчанию используется клиентами без индивидуального выбора.'
+		]),
+		E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-default-dns' }, [ 'Default DNS' ]),
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('input', {
+					'id': 'sockroute-default-dns',
+					'type': 'text',
+					'class': 'cbi-input-text',
+					'style': 'width:100%; max-width:42em;',
+					'value': defaultDnsServer,
+					'placeholder': 'udp://100.100.0.156'
+				}),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-save',
+					'click': ui.createHandlerFn(viewObject, 'handleSaveDefaultDns')
+				}, [ 'Сохранить default DNS' ]),
+				E('div', { 'class': 'cbi-value-description' }, [
+					'Форматы: 100.100.0.156, udp://100.100.0.156, tls://1.1.1.1, https://1.1.1.1/dns-query. LAN DNS используется напрямую.'
+				])
+			])
+		]),
+		E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-dns-standard' }, [ 'DNS standard' ]),
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('input', {
+					'id': 'sockroute-dns-standard',
+					'type': 'text',
+					'class': 'cbi-input-text',
+					'style': 'width:100%; max-width:42em;',
+					'value': standard.server,
+					'placeholder': 'udp://100.100.0.217'
+				})
+			])
+		]),
+		E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-dns-unblock' }, [ 'DNS unblock' ]),
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('input', {
+					'id': 'sockroute-dns-unblock',
+					'type': 'text',
+					'class': 'cbi-input-text',
+					'style': 'width:100%; max-width:42em;',
+					'value': unblock.server,
+					'placeholder': 'udp://100.100.0.156'
+				}),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-save',
+					'click': ui.createHandlerFn(viewObject, 'handleSaveDnsProfiles')
+				}, [ 'Сохранить DNS профили' ])
+			])
+		])
+	]);
 }
 
 function clientSourceLabel(source) {
@@ -1144,6 +1545,232 @@ return view.extend({
 		}, this));
 	},
 
+	handleSettingsModal: function(settings) {
+		var apiExamplesText = buildApiExamplesText(settings.clients || [], settings.socksProfiles || [], settings.apiRoot || apiRoot(), settings.apiToken || '');
+		var apiExamples = buildApiExamplesTable(settings.clients || [], settings.socksProfiles || [], settings.apiRoot || apiRoot(), settings.apiToken || '');
+		var haYaml = buildHomeAssistantYaml(settings.clients || [], settings.apiRoot || apiRoot(), settings.apiToken || '');
+		var runtimeText = settings.runtime || settings.runtimeError || (settings.deferredLoaded ? 'Нет runtime-данных.' : 'Runtime-данные загружаются после открытия страницы...');
+
+		ui.showModal('Настройки SockRoute', [
+			E('div', { 'class': 'cbi-map' }, [
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, [ 'Проверки' ]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-auto-apply' }, [ 'Автосохранение' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-auto-apply',
+								'type': 'checkbox',
+								'checked': settings.autoApply ? 'checked' : null
+							}),
+							' ',
+							E('span', {}, [ 'сразу применять изменения в таблицах' ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-check-loop' }, [ 'Проверка по кругу' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-check-loop',
+								'type': 'checkbox',
+								'checked': settings.checkLoop ? 'checked' : null
+							}),
+							' ',
+							E('span', {}, [ 'повторять проверки SOCKS и DNS' ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-socks-check-interval' }, [ 'SOCKS проверки' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-socks-check-interval',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'width:8em;',
+								'value': String(settings.socksCheckInterval || 30)
+							}),
+							' ',
+							E('span', {}, [ 'секунд' ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-dns-check-interval' }, [ 'DNS проверки' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-dns-check-interval',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'width:8em;',
+								'value': String(settings.dnsCheckInterval || 30)
+							}),
+							' ',
+							E('span', {}, [ 'секунд' ])
+						])
+					])
+				]),
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, [ 'API' ]),
+					E('div', { 'class': 'cbi-section-descr' }, [
+						'HTTP API принимает запросы только с разрешённых IP. Token необязателен; если он задан, его нужно передавать в URL или заголовке X-SockRoute-Token.'
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-api-allowed-sources' }, [ 'Разрешённые IP' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-api-allowed-sources',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'min-width:28em;',
+								'value': (settings.allowedSources || []).join(' '),
+								'placeholder': '192.168.1.2 192.168.1.3'
+							})
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-api-target-cidr' }, [ 'Сеть клиентов' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-api-target-cidr',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'min-width:12em;',
+								'value': settings.targetCidr || '192.168.1.0/24',
+								'placeholder': '192.168.1.0/24'
+							})
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-api-token' }, [ 'API token' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-api-token',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'width:100%; max-width:28em;',
+								'value': settings.apiToken || '',
+								'placeholder': 'пусто: проверка только по IP'
+							}),
+							' ',
+							E('button', {
+								'class': 'btn cbi-button-action',
+								'click': ui.createHandlerFn(this, 'handleGenerateApiToken')
+							}, [ 'Сгенерировать' ])
+						])
+					]),
+					buildApiHelp(settings.clients || [], settings.socksProfiles || [], settings.apiRoot || apiRoot(), settings.apiToken || ''),
+					E('details', {}, [
+						E('summary', { 'style': 'cursor:pointer; font-weight:bold;' }, [ 'Примеры API URL' ]),
+						E('div', { 'class': 'cbi-section-descr' }, [
+							'URL генерируются по текущему списку клиентов, текущему адресу LuCI и сохранённым исходящим SOCKS.'
+						]),
+						E('button', {
+							'class': 'btn cbi-button-action',
+							'click': function() {
+								return copyText(apiExamplesText, 'API URL скопированы.');
+							}
+						}, [ 'Копировать все URL' ]),
+						apiExamples
+					])
+				]),
+				E('details', { 'class': 'cbi-section' }, [
+					E('summary', { 'style': 'cursor:pointer; font-weight:bold;' }, [ 'Home Assistant command_line' ]),
+					E('div', { 'class': 'cbi-section-descr' }, [
+						'YAML генерируется по текущему списку клиентов. После добавления, удаления или редактирования клиента этот блок автоматически меняется.'
+					]),
+					E('button', {
+						'class': 'btn cbi-button-action',
+						'click': function() {
+							return copyText(haYaml, 'Home Assistant YAML скопирован.');
+						}
+					}, [ 'Копировать YAML' ]),
+					E('pre', { 'style': 'white-space:pre-wrap; max-height:360px; overflow:auto;' }, [ haYaml ])
+				]),
+				E('details', { 'class': 'cbi-section' }, [
+					E('summary', { 'style': 'cursor:pointer; font-weight:bold;' }, [ 'Runtime set' ]),
+					E('div', { 'class': 'right', 'style': 'margin-bottom:8px;' }, [
+						E('button', {
+							'class': 'btn cbi-button-action',
+							'click': ui.createHandlerFn(this, 'handleSetup')
+						}, [ 'Обновить runtime' ])
+					]),
+					E('pre', {
+						'id': 'sockroute-runtime-pre',
+						'style': 'white-space:pre-wrap; max-height:320px; overflow:auto;'
+					}, [ runtimeText ])
+				])
+			]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ 'Отмена' ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-save important',
+					'disabled': window.sockrouteAutoApplyBusy ? 'disabled' : null,
+					'click': ui.createHandlerFn(this, 'handleSaveSettings')
+				}, [ 'Сохранить' ])
+			])
+		]);
+	},
+
+	handleSaveSettings: function() {
+		var autoInput = document.getElementById('sockroute-auto-apply');
+		var checkLoopInput = document.getElementById('sockroute-check-loop');
+		var socksIntervalInput = document.getElementById('sockroute-socks-check-interval');
+		var dnsIntervalInput = document.getElementById('sockroute-dns-check-interval');
+		var sourcesInput = document.getElementById('sockroute-api-allowed-sources');
+		var cidrInput = document.getElementById('sockroute-api-target-cidr');
+		var tokenInput = document.getElementById('sockroute-api-token');
+		var socksInterval = socksIntervalInput ? socksIntervalInput.value.trim() : '';
+		var dnsInterval = dnsIntervalInput ? dnsIntervalInput.value.trim() : '';
+		var sources = splitList(sourcesInput ? sourcesInput.value : '');
+		var cidr = cidrInput ? cidrInput.value.trim() : '';
+		var token = tokenInput ? tokenInput.value.trim() : '';
+
+		if (!validateIntervalSeconds(socksInterval)) {
+			ui.addNotification(null, E('p', 'Интервал проверки SOCKS должен быть 5-3600 секунд.'), 'danger');
+			return Promise.resolve();
+		}
+		if (!validateIntervalSeconds(dnsInterval)) {
+			ui.addNotification(null, E('p', 'Интервал проверки DNS должен быть 5-3600 секунд.'), 'danger');
+			return Promise.resolve();
+		}
+		if (sources.length === 0) {
+			ui.addNotification(null, E('p', 'Нужно указать хотя бы один разрешённый IP.'), 'danger');
+			return Promise.resolve();
+		}
+		for (var i = 0; i < sources.length; i++) {
+			if (!validateIp4(sources[i])) {
+				ui.addNotification(null, E('p', 'Неверный разрешённый IP: %s'.format(sources[i])), 'danger');
+				return Promise.resolve();
+			}
+		}
+		if (!validateCidr4(cidr)) {
+			ui.addNotification(null, E('p', 'Сеть клиентов должна быть в CIDR-формате, например 192.168.1.0/24.'), 'danger');
+			return Promise.resolve();
+		}
+		if (!validateApiToken(token)) {
+			ui.addNotification(null, E('p', 'Token должен быть пустым или содержать 8-128 символов: A-Z, a-z, 0-9, точка, подчёркивание, тире, тильда.'), 'danger');
+			return Promise.resolve();
+		}
+
+		uci.set('sockroute', 'main', 'auto_apply', autoInput && autoInput.checked ? '1' : '0');
+		uci.set('sockroute', 'main', 'check_loop', checkLoopInput && checkLoopInput.checked ? '1' : '0');
+		uci.set('sockroute', 'main', 'socks_check_interval', socksInterval);
+		uci.set('sockroute', 'main', 'dns_check_interval', dnsInterval);
+		uci.set('sockroute_api', 'main', 'allowed_source_ip', sources);
+		uci.set('sockroute_api', 'main', 'allowed_target_cidr', cidr);
+		uci.unset('sockroute_api', 'main', 'allowed_target_prefix');
+		uci.set('sockroute_api', 'main', 'backend', 'sockroute');
+		if (token)
+			uci.set('sockroute_api', 'main', 'token', token);
+		else
+			uci.unset('sockroute_api', 'main', 'token');
+
+		return uci.save().then(L.bind(ui.changes.init, ui.changes)).then(L.bind(ui.changes.apply, ui.changes)).then(L.bind(function() {
+			ui.hideModal();
+			return this.notifyAndRefresh('Настройки SockRoute сохранены.');
+		}, this));
+	},
+
 	handleToggleClient: function(enabled, ip, fallbackLabel) {
 		if (!validateIp4(ip)) {
 			ui.addNotification(null, E('p', 'Неверный IPv4-адрес.'), 'danger');
@@ -1161,12 +1788,136 @@ return view.extend({
 		}, this));
 	},
 
+	pendingClientChanges: function() {
+		if (typeof(window) === 'undefined')
+			return {};
+		if (!window.sockroutePendingClientChanges)
+			window.sockroutePendingClientChanges = {};
+		return window.sockroutePendingClientChanges;
+	},
+
+	pendingClientChangeCount: function() {
+		var pending = this.pendingClientChanges();
+		var count = 0;
+
+		for (var ip in pending)
+			if (pending.hasOwnProperty(ip))
+				count++;
+		return count;
+	},
+
+	updatePendingClientUi: function() {
+		var count = this.pendingClientChangeCount();
+		var counter = document.getElementById('sockroute-pending-client-count');
+		var button = document.getElementById('sockroute-save-pending-clients');
+
+		if (counter)
+			counter.textContent = count ? 'Ожидают сохранения: %d'.format(count) : '';
+		if (button)
+			button.disabled = count ? null : 'disabled';
+	},
+
+	stageClientChange: function(client, key, value) {
+		var pending = this.pendingClientChanges();
+		var marker;
+
+		if (!validateIp4(client.ip)) {
+			ui.addNotification(null, E('p', 'Неверный IPv4-адрес клиента.'), 'danger');
+			return Promise.resolve();
+		}
+
+		if (!pending[client.ip])
+			pending[client.ip] = { label: client.label || client.ip };
+		pending[client.ip][key] = value;
+
+		marker = document.getElementById('sockroute-client-pending-%s'.format(domId(client.ip)));
+		if (marker)
+			marker.textContent = 'есть изменения';
+		this.updatePendingClientUi();
+		ui.addNotification(null, E('p', 'Изменение клиента "%s" ожидает сохранения.'.format(client.label || client.ip)), 'info');
+		return Promise.resolve();
+	},
+
+	handleSavePendingClientChanges: function() {
+		var pending = this.pendingClientChanges();
+		var socksProfiles = this.socksProfiles || [];
+		var ips = [];
+		var sequence = Promise.resolve();
+
+		for (var ip in pending)
+			if (pending.hasOwnProperty(ip))
+				ips.push(ip);
+
+		if (!ips.length) {
+			ui.addNotification(null, E('p', 'Изменений для сохранения нет.'), 'info');
+			return Promise.resolve();
+		}
+
+		window.sockrouteAutoApplyBusy = true;
+
+		ips.forEach(L.bind(function(ip) {
+			var change = pending[ip] || {};
+
+			sequence = sequence.then(L.bind(function() {
+				var value = change.socks;
+				var selectedRef;
+				var endpoint;
+
+				if (value == null)
+					return Promise.resolve();
+
+				selectedRef = value && value.indexOf('ref|') === 0 ? value.split('|')[1] : '';
+				endpoint = endpointFromValue(value, socksProfiles);
+
+				if (!value)
+					return this.runCommand(helperPath, [ 'clear-client-socks', ip ]);
+				if (selectedRef)
+					return this.runCommand(helperPath, [ 'rename', ip, change.label || ip ]).then(L.bind(function() {
+						return this.runCommand(helperPath, [ 'set-client-socks-ref', ip, selectedRef ]);
+					}, this));
+				if (endpoint && validateIp4(endpoint.host) && validatePort(endpoint.port))
+					return this.runCommand(helperPath, [ 'rename', ip, change.label || ip ]).then(L.bind(function() {
+						return this.runCommand(helperPath, [ 'set-client-socks', ip, endpoint.host, endpoint.port ]);
+					}, this));
+
+				ui.addNotification(null, E('p', 'Неверный исходящий SOCKS для %s.'.format(ip)), 'danger');
+				return Promise.reject(new Error('bad pending socks'));
+			}, this)).then(L.bind(function() {
+				var value = change.dns;
+
+				if (value == null)
+					return Promise.resolve();
+				if (!value)
+					return this.runCommand(helperPath, [ 'clear-client-dns', ip ]);
+				if (value === 'manual') {
+					ui.addNotification(null, E('p', 'Manual DNS для %s меняется через Edit.'.format(ip)), 'danger');
+					return Promise.reject(new Error('bad pending dns'));
+				}
+				return this.runCommand(helperPath, [ 'set-client-dns-ref', ip, value ]);
+			}, this));
+		}, this));
+
+		return sequence.then(L.bind(function() {
+			return this.runCommand(initPath, [ 'restart' ]);
+		}, this)).then(L.bind(function() {
+			window.sockroutePendingClientChanges = {};
+			window.sockrouteAutoApplyBusy = false;
+			return this.notifyAndRefresh('Изменения клиентов сохранены, SockRoute перезапущен.');
+		}, this), function(err) {
+			window.sockrouteAutoApplyBusy = false;
+			throw err;
+		});
+	},
+
 	handleClientSocksChange: function(client, value) {
 		var selectedRef = value && value.indexOf('ref|') === 0 ? value.split('|')[1] : '';
 		var endpoint = endpointFromValue(value, this.socksProfiles || []);
 		var sequence;
 		var selectedProfile = selectedRef ? findSocksProfile(this.socksProfiles || [], selectedRef) : null;
 
+		if (!this.autoApply) {
+			return this.stageClientChange(client, 'socks', value);
+		}
 		if (!validateIp4(client.ip)) {
 			ui.addNotification(null, E('p', 'Неверный IPv4-адрес клиента.'), 'danger');
 			return Promise.resolve();
@@ -1186,10 +1937,11 @@ return view.extend({
 			}, this));
 		}
 		else {
-			ui.addNotification(null, E('p', 'Неверный SOCKS outbound.'), 'danger');
+			ui.addNotification(null, E('p', 'Неверный исходящий SOCKS.'), 'danger');
 			return Promise.resolve();
 		}
 
+		window.sockrouteAutoApplyBusy = true;
 		return sequence.then(L.bind(function() {
 			return this.runCommand(initPath, [ 'restart' ]);
 		}, this)).then(L.bind(function() {
@@ -1213,8 +1965,49 @@ return view.extend({
 			}
 
 			recalculateSocksUsage();
-			ui.addNotification(null, E('p', 'SOCKS outbound клиента обновлён.'), 'info');
-		}, this));
+			window.sockrouteAutoApplyBusy = false;
+			ui.addNotification(null, E('p', 'Исходящий SOCKS клиента обновлён.'), 'info');
+		}, this), function(err) {
+			window.sockrouteAutoApplyBusy = false;
+			throw err;
+		});
+	},
+
+	handleClientDnsChange: function(client, value) {
+		if (!this.autoApply) {
+			return this.stageClientChange(client, 'dns', value);
+		}
+		if (!validateIp4(client.ip)) {
+			ui.addNotification(null, E('p', 'Неверный IPv4-адрес клиента.'), 'danger');
+			return Promise.resolve();
+		}
+
+		window.sockrouteAutoApplyBusy = true;
+		if (!value) {
+			return this.runCommand(helperPath, [ 'clear-client-dns', client.ip ]).then(L.bind(function() {
+				return this.runCommand(initPath, [ 'restart' ]);
+			}, this)).then(L.bind(function() {
+				client.dnsRef = '';
+				client.dnsServers = [];
+				window.sockrouteAutoApplyBusy = false;
+				ui.addNotification(null, E('p', 'DNS клиента переключён на default.'), 'info');
+			}, this), function(err) {
+				window.sockrouteAutoApplyBusy = false;
+				throw err;
+			});
+		}
+
+		return this.runCommand(helperPath, [ 'set-client-dns-ref', client.ip, value ]).then(L.bind(function() {
+			return this.runCommand(initPath, [ 'restart' ]);
+		}, this)).then(L.bind(function() {
+			client.dnsRef = value;
+			client.dnsServers = [];
+			window.sockrouteAutoApplyBusy = false;
+			ui.addNotification(null, E('p', 'DNS клиента обновлён.'), 'info');
+		}, this), function(err) {
+			window.sockrouteAutoApplyBusy = false;
+			throw err;
+		});
 	},
 
 	handleDeleteClient: function(ip, fallbackLabel) {
@@ -1238,6 +2031,7 @@ return view.extend({
 		var socksSelectId = 'sockroute-edit-socks-candidate';
 		var socksHostId = 'sockroute-edit-socks-host';
 		var socksPortId = 'sockroute-edit-socks-port';
+		var dnsServersId = 'sockroute-edit-dns-servers';
 		var selectedSocks = client.socksRef ? 'ref|' + client.socksRef : client.socksHost && client.socksPort ? rawSocksValue(client.socksHost, client.socksPort) : '';
 		var socksOptions = [
 			E('option', { 'value': '' }, [ 'Использовать SOCKS по умолчанию' ])
@@ -1285,7 +2079,7 @@ return view.extend({
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title', 'for': socksSelectId }, [ 'SOCKS outbound' ]),
+						E('label', { 'class': 'cbi-value-title', 'for': socksSelectId }, [ 'Исходящие SOCKS' ]),
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('select', {
 								'id': socksSelectId,
@@ -1295,6 +2089,20 @@ return view.extend({
 									fillSocksInputIds(ev.target.value, socksHostId, socksPortId, socksProfiles);
 								}
 							}, socksOptions)
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': dnsServersId }, [ 'DNS серверы' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('textarea', {
+								'id': dnsServersId,
+								'class': 'cbi-input-textarea',
+								'style': 'width:100%; max-width:42em; min-height:5em;',
+								'placeholder': 'udp://1.1.1.1\ntls://1.1.1.1\nhttps://1.1.1.1/dns-query'
+							}, [ (client.dnsServers || []).join('\n') ]),
+							E('div', { 'class': 'cbi-value-description' }, [
+								'Один или несколько DNS для клиента. Форматы: UDP/TLS/HTTPS, например 1.1.1.1, udp://8.8.8.8, tls://1.1.1.1, https://1.1.1.1/dns-query. Пусто — default DNS: %s.'.format(uci.get('sockroute', 'main', 'default_dns_server') || ('udp://' + (uci.get('sockroute', 'main', 'realip_dns_addr') || '1.1.1.1')))
+							])
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
@@ -1332,7 +2140,7 @@ return view.extend({
 				' ',
 				E('button', {
 					'class': 'btn cbi-button-save important',
-					'click': ui.createHandlerFn(this, 'handleEditClientSave', client, labelId, ipId, socksSelectId, socksHostId, socksPortId, defaultSocksHost, defaultSocksPort)
+					'click': ui.createHandlerFn(this, 'handleEditClientSave', client, labelId, ipId, socksSelectId, socksHostId, socksPortId, dnsServersId, defaultSocksHost, defaultSocksPort)
 				}, [ 'Сохранить' ])
 			])
 		]);
@@ -1342,18 +2150,20 @@ return view.extend({
 			input.focus();
 	},
 
-	handleEditClientSave: function(client, labelId, ipId, socksSelectId, socksHostId, socksPortId, defaultSocksHost, defaultSocksPort) {
+	handleEditClientSave: function(client, labelId, ipId, socksSelectId, socksHostId, socksPortId, dnsServersId, defaultSocksHost, defaultSocksPort) {
 		var labelInput = document.getElementById(labelId);
 		var ipInput = document.getElementById(ipId);
 		var socksSelect = document.getElementById(socksSelectId);
 		var socksHostInput = document.getElementById(socksHostId);
 		var socksPortInput = document.getElementById(socksPortId);
+		var dnsServersInput = document.getElementById(dnsServersId);
 		var label = labelInput ? labelInput.value.trim() : '';
 		var ip = ipInput ? ipInput.value.trim() : '';
 		var selectedSocks = socksSelect ? socksSelect.value : '';
 		var selectedRef = selectedSocks.indexOf('ref|') === 0 ? selectedSocks.split('|')[1] : '';
 		var socksHost = socksHostInput ? socksHostInput.value.trim() : '';
 		var socksPort = socksPortInput ? socksPortInput.value.trim() : '';
+		var dnsServers = splitList(dnsServersInput ? dnsServersInput.value : '');
 		var customSocks = socksHost || socksPort;
 		var sequence;
 
@@ -1365,6 +2175,13 @@ return view.extend({
 		if (customSocks && (!validateIp4(socksHost) || !validatePort(socksPort))) {
 			ui.addNotification(null, E('p', 'SOCKS клиента должен быть пустым или задан как IPv4 + порт.'), 'danger');
 			return Promise.resolve();
+		}
+
+		for (var i = 0; i < dnsServers.length; i++) {
+			if (!validateDnsServerSpec(dnsServers[i])) {
+				ui.addNotification(null, E('p', 'Неверный DNS сервер: %s'.format(dnsServers[i])), 'danger');
+				return Promise.resolve();
+			}
 		}
 
 		label = label || ip;
@@ -1386,13 +2203,18 @@ return view.extend({
 				return this.runCommand(helperPath, [ 'clear-client-socks', ip ]);
 			return this.runCommand(helperPath, [ 'set-client-socks', ip, socksHost, socksPort ]);
 		}, this)).then(L.bind(function() {
+			if (dnsServers.length)
+				return this.runCommand(helperPath, [ 'set-client-dns', ip ].concat(dnsServers));
+			if (client.dnsRef)
+				return this.runCommand(helperPath, [ 'set-client-dns-ref', ip, client.dnsRef ]);
+			return this.runCommand(helperPath, [ 'clear-client-dns', ip ]);
+		}, this)).then(L.bind(function() {
 			return this.runCommand(initPath, [ 'restart' ]);
 		}, this)).then(L.bind(function() {
 			ui.hideModal();
 			return this.notifyAndRefresh('Клиент обновлён.');
 		}, this));
 	},
-
 	handleSaveApi: function() {
 		var sourcesInput = document.getElementById('sockroute-api-allowed-sources');
 		var cidrInput = document.getElementById('sockroute-api-target-cidr');
@@ -1463,7 +2285,7 @@ return view.extend({
 		return this.runCommand(helperPath, [ 'set-socks', host, port ]).then(L.bind(function() {
 			return this.runCommand(initPath, [ 'restart' ]);
 		}, this)).then(L.bind(function() {
-			return this.notifyAndRefresh('SOCKS outbound сохранён, SockRoute перезапущен.');
+			return this.notifyAndRefresh('Исходящий SOCKS сохранён, SockRoute перезапущен.');
 		}, this));
 	},
 
@@ -1472,6 +2294,144 @@ return view.extend({
 			return this.runCommand(initPath, [ 'restart' ]);
 		}, this)).then(L.bind(function() {
 			return this.notifyAndRefresh('SOCKS профиль выбран по умолчанию, SockRoute перезапущен.');
+		}, this));
+	},
+
+	handleSaveDefaultDns: function() {
+		var dnsInput = document.getElementById('sockroute-default-dns');
+		var dnsServer = dnsInput ? dnsInput.value.trim() : '';
+
+		if (!validateDnsServerSpec(dnsServer)) {
+			ui.addNotification(null, E('p', 'Неверный default DNS. Форматы: 100.100.0.156, udp://100.100.0.156, tls://1.1.1.1, https://1.1.1.1/dns-query.'), 'danger');
+			return Promise.resolve();
+		}
+
+		return this.runCommand(helperPath, [ 'set-default-dns', dnsServer ]).then(L.bind(function() {
+			return this.runCommand(initPath, [ 'restart' ]);
+		}, this)).then(L.bind(function() {
+			return this.notifyAndRefresh('Default DNS сохранён, SockRoute перезапущен.');
+		}, this));
+	},
+
+	handleSaveDnsProfiles: function() {
+		var standardInput = document.getElementById('sockroute-dns-standard');
+		var unblockInput = document.getElementById('sockroute-dns-unblock');
+		var standard = standardInput ? standardInput.value.trim() : '';
+		var unblock = unblockInput ? unblockInput.value.trim() : '';
+
+		if (!validateDnsServerSpec(standard)) {
+			ui.addNotification(null, E('p', 'Неверный DNS для DNS standard.'), 'danger');
+			return Promise.resolve();
+		}
+		if (!validateDnsServerSpec(unblock)) {
+			ui.addNotification(null, E('p', 'Неверный DNS для DNS unblock.'), 'danger');
+			return Promise.resolve();
+		}
+
+		return this.runCommand(helperPath, [ 'set-dns-profile', 'standard', standard ]).then(L.bind(function() {
+			return this.runCommand(helperPath, [ 'set-dns-profile', 'unblock', unblock ]);
+		}, this)).then(L.bind(function() {
+			return this.runCommand(initPath, [ 'restart' ]);
+		}, this)).then(L.bind(function() {
+			return this.notifyAndRefresh('DNS профили сохранены, SockRoute перезапущен.');
+		}, this));
+	},
+
+	handleSaveDnsRef: function(section) {
+		return this.runCommand(helperPath, [ 'set-dns-ref', section ]).then(L.bind(function() {
+			return this.runCommand(initPath, [ 'restart' ]);
+		}, this)).then(L.bind(function() {
+			return this.notifyAndRefresh('DNS профиль выбран по умолчанию, SockRoute перезапущен.');
+		}, this));
+	},
+
+	handleTestDnsProfile: function(profile) {
+		return this.runCommand(helperPath, [ 'test-dns-profile', profile.section ]).then(function(res) {
+			ui.showModal('Проверка DNS %s'.format(profile.label), [
+				buildHealthTable(parseHealth(res.stdout || '')),
+				E('div', { 'class': 'right' }, [
+					E('button', { 'class': 'btn', 'click': ui.hideModal }, [ 'Закрыть' ])
+				])
+			]);
+		});
+	},
+
+	handleEditDnsProfile: function(profile) {
+		var labelId = 'sockroute-dns-profile-label';
+		var serverId = 'sockroute-dns-profile-server';
+		var title = profile && profile.section ? 'Редактировать DNS профиль' : 'Добавить DNS профиль';
+
+		ui.showModal(title, [
+			E('div', { 'class': 'cbi-map' }, [
+				E('div', { 'class': 'cbi-section' }, [
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': labelId }, [ 'Название' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': labelId,
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'value': profile && profile.label || '',
+								'placeholder': 'DNS profile'
+							})
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': serverId }, [ 'DNS server' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': serverId,
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'width:100%; max-width:42em;',
+								'value': profile && profile.server || '',
+								'placeholder': 'udp://100.100.0.217'
+							})
+						])
+					])
+				])
+			]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ 'Отмена' ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-save important',
+					'click': ui.createHandlerFn(this, 'handleSaveDnsProfile', profile && profile.section || '-', labelId, serverId)
+				}, [ 'Сохранить и проверить' ])
+			])
+		]);
+	},
+
+	handleSaveDnsProfile: function(section, labelId, serverId) {
+		var labelInput = document.getElementById(labelId);
+		var serverInput = document.getElementById(serverId);
+		var label = labelInput ? labelInput.value.trim() : '';
+		var server = serverInput ? serverInput.value.trim() : '';
+
+		if (!label) {
+			ui.addNotification(null, E('p', 'Нужно указать название DNS профиля.'), 'danger');
+			return Promise.resolve();
+		}
+		if (!validateDnsServerSpec(server)) {
+			ui.addNotification(null, E('p', 'Неверный DNS server.'), 'danger');
+			return Promise.resolve();
+		}
+
+		return this.runCommand(helperPath, [ 'set-dns-profile', section, label, server ]).then(L.bind(function() {
+			return this.runCommand(initPath, [ 'restart' ]);
+		}, this)).then(L.bind(function() {
+			ui.hideModal();
+			return this.notifyAndRefresh('DNS профиль сохранён, SockRoute перезапущен.');
+		}, this));
+	},
+
+	handleDeleteDnsProfile: function(profile) {
+		if (!window.confirm('Удалить DNS профиль "%s"? Клиенты с этим профилем перейдут на default DNS.'.format(profile.label)))
+			return Promise.resolve();
+		return this.runCommand(helperPath, [ 'delete-dns-profile', profile.section ]).then(L.bind(function() {
+			return this.runCommand(initPath, [ 'restart' ]);
+		}, this)).then(L.bind(function() {
+			return this.notifyAndRefresh('DNS профиль удалён, SockRoute перезапущен.');
 		}, this));
 	},
 
@@ -1501,6 +2461,100 @@ return view.extend({
 
 	handleAddSocksProfile: function() {
 		return this.handleSaveSocksProfile('-', 'sockroute-socks-label', 'sockroute-socks-host', 'sockroute-socks-port');
+	},
+
+	handleAddSocksProfileModal: function(socksCandidates, socksHost, socksPort, socksWarnings, socksLabels) {
+		var candidateId = 'sockroute-socks-candidate';
+		var candidateOptions = [
+			E('option', { 'value': '' }, [ 'Ручной ввод' ])
+		].concat((socksCandidates || []).map(function(candidate) {
+			var value = rawSocksValue(candidate.host, candidate.port);
+			var text = '%s:%s - [%s] %s'.format(candidate.host, candidate.port, socksCandidateBadge(candidate), candidate.label);
+			if (candidate.source)
+				text += ' [%s]'.format(candidate.source);
+			return E('option', { 'value': value }, [ text ]);
+		}));
+
+		ui.showModal('Добавить исходящий SOCKS', [
+			E('div', { 'class': 'cbi-map' }, [
+				E('div', { 'class': 'cbi-section' }, [
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': candidateId }, [ 'SOCKS endpoint' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('select', {
+								'id': candidateId,
+								'class': 'cbi-input-select',
+								'style': 'width:100%; max-width:42em;',
+								'change': function(ev) {
+									fillSocksBuilder(ev.target.value, socksWarnings || {}, socksLabels || {});
+								}
+							}, candidateOptions),
+							(socksCandidates || []).length ? '' : E('div', { 'class': 'cbi-value-description' }, [ 'Кандидаты не найдены, можно указать endpoint вручную.' ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ 'Подсказка' ]),
+						E('div', {
+							'id': 'sockroute-socks-warning',
+							'class': 'cbi-value-field'
+						}, [ socksCandidateWarning(null) ])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-socks-label' }, [ 'Профиль' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-socks-label',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'width:100%; max-width:18em;',
+								'placeholder': 'Название нового профиля'
+							}),
+							' ',
+							E('input', {
+								'id': 'sockroute-socks-host',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'width:100%; max-width:14em;',
+								'value': socksHost || '',
+								'placeholder': 'SOCKS IP'
+							}),
+							' ',
+							E('input', {
+								'id': 'sockroute-socks-port',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'style': 'width:8em;',
+								'value': socksPort || '',
+								'placeholder': 'порт'
+							})
+						])
+					])
+				])
+			]),
+			E('div', { 'class': 'right' }, [
+				E('button', {
+					'class': 'btn',
+					'click': ui.hideModal
+				}, [ 'Закрыть' ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-add',
+					'title': 'Создать сохранённый SOCKS профиль из указанного endpoint',
+					'click': ui.createHandlerFn(this, 'handleAddSocksProfile')
+				}, [ 'Добавить профиль' ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-save',
+					'title': 'Сделать указанный endpoint SOCKS по умолчанию и перезапустить только SockRoute',
+					'click': ui.createHandlerFn(this, 'handleSaveSocks')
+				}, [ 'Сделать default' ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-action',
+					'click': ui.createHandlerFn(this, 'handleTestSocksManual', 'sockroute-socks-host', 'sockroute-socks-port')
+				}, [ 'Проверить' ])
+			])
+		]);
 	},
 
 	handleEditSocksProfile: function(profile, socksCandidates) {
@@ -1616,6 +2670,85 @@ return view.extend({
 		}, this));
 	},
 
+	handleAddClientModal: function(deferredLoaded, dhcpHosts, dhcpOptions, dhcpRows) {
+		ui.showModal('Добавить клиента', [
+			E('div', { 'class': 'cbi-map' }, [
+				E('div', { 'class': 'cbi-section' }, [
+					E('div', { 'class': 'cbi-section-descr' }, [
+						'Одиночное добавление и массовый импорт используют один источник: закреплённые DHCP host-записи из /etc/config/dhcp.'
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-dhcp-picker' }, [ 'DHCP host-запись' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							!deferredLoaded ? E('em', {}, [ 'DHCP host-записи загружаются после открытия страницы...' ]) : (dhcpHosts || []).length ? E('select', {
+								'id': 'sockroute-dhcp-picker',
+								'class': 'cbi-input-select',
+								'style': 'width:100%; max-width:42em;',
+								'change': function(ev) {
+									fillClientFromDhcp(ev.target.value);
+								}
+							}, dhcpOptions || []) : E('em', {}, [ 'Закреплённые DHCP host-записи не найдены.' ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-label' }, [ 'Название' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-label',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'placeholder': 'Телевизор'
+							})
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-ip' }, [ 'IP клиента' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'sockroute-ip',
+								'type': 'text',
+								'class': 'cbi-input-text',
+								'placeholder': '192.168.1.100'
+							}),
+							' ',
+							E('button', {
+								'class': 'btn cbi-button-add',
+								'click': ui.createHandlerFn(this, 'handleAddManual')
+							}, [ 'Добавить и ON' ])
+						])
+					]),
+					E('details', { 'style': 'margin-top:12px;' }, [
+						E('summary', {
+							'style': 'cursor:pointer; display:inline-block; padding:4px 10px; border-radius:4px; border:1px solid rgba(127,127,127,.45); font-weight:700;'
+						}, [ 'Импорт из DHCP' ]),
+						E('div', { 'class': 'cbi-section-descr', 'style': 'margin-top:8px;' }, [
+							'Выберите несколько закреплённых DHCP host-записей и добавьте их в профиль или сразу включите SockRoute.'
+						]),
+						!deferredLoaded ? E('em', {}, [ 'DHCP host-записи загружаются после открытия страницы...' ]) : (dhcpHosts || []).length ? E('div', {}, [
+							E('div', { 'class': 'right' }, [
+								E('button', {
+									'class': 'btn cbi-button-add',
+									'click': ui.createHandlerFn(this, 'handleImportDhcp', false)
+								}, [ 'Добавить выбранные' ]),
+								' ',
+								E('button', {
+									'class': 'btn cbi-button-apply',
+									'click': ui.createHandlerFn(this, 'handleImportDhcp', true)
+								}, [ 'Добавить выбранные и ON' ])
+							]),
+							E('div', { 'style': 'max-height:360px; overflow:auto;' }, [
+								E('table', dataTableAttrs('cbi-section-table'), dhcpRows || [])
+							])
+						]) : E('em', {}, [ 'Закреплённые DHCP host-записи не найдены.' ])
+					])
+				])
+			]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ 'Закрыть' ])
+			])
+		]);
+	},
+
 	handleAddManual: function() {
 		var ipInput = document.getElementById('sockroute-ip');
 		var labelInput = document.getElementById('sockroute-label');
@@ -1699,7 +2832,7 @@ return view.extend({
 		var map = {};
 		var order = [];
 
-		function add(ip, label, source, socksRef, socksHost, socksPort) {
+		function add(ip, label, source, socksRef, socksHost, socksPort, dnsServers, dnsRef) {
 			var profile = findSocksProfile(socksProfiles, socksRef || '');
 			var counter = counters && counters[ip] || {};
 
@@ -1718,13 +2851,15 @@ return view.extend({
 				socksLabel: profile ? profile.label : '',
 				socksHost: profile ? profile.host : socksHost || '',
 				socksPort: profile ? profile.port : socksPort || '',
+				dnsServers: asList(dnsServers),
+				dnsRef: dnsRef || '',
 				packets: counter.packets || 0,
 				bytes: counter.bytes || 0
 			};
 		}
 
 		uci.sections('sockroute', 'client').forEach(function(section) {
-			add(section.ip, section.label || sectionId(section) || section.ip, 'profile', section.socks_ref || '', section.socks_host || '', section.socks_port || '');
+			add(section.ip, section.label || sectionId(section) || section.ip, 'profile', section.socks_ref || '', section.socks_host || '', section.socks_port || '', section.dns_server || [], section.dns_ref || '');
 		});
 
 		activeClients.forEach(function(ip) {
@@ -1741,7 +2876,7 @@ return view.extend({
 		});
 	},
 
-	clientRow: function(client) {
+	clientRow: function(client, index) {
 		var self = this;
 		var buttonClass = client.active ? 'btn cbi-button-remove' : 'btn cbi-button-apply';
 		var buttonText = client.active ? 'OFF' : 'ON';
@@ -1749,6 +2884,8 @@ return view.extend({
 		var source = clientSourceLabel(client.source);
 		var selectedSocks = clientSocksValue(client);
 		var socksProfiles = this.socksProfiles || [];
+		var dnsProfiles = this.dnsProfiles || [];
+		var selectedDns = client.dnsRef || ((client.dnsServers || []).length ? 'manual' : '');
 		var socksOptions = [
 			E('option', { 'value': '' }, [ 'default' ])
 		].concat(socksProfiles.map(function(profile) {
@@ -1765,10 +2902,18 @@ return view.extend({
 				'%s:%s'.format(client.socksHost, client.socksPort)
 			]));
 		}
+		var dnsOptions = [
+			E('option', { 'value': '' }, [ 'default' ])
+		].concat(dnsProfiles.map(function(profile) {
+			var attrs = { 'value': profile.ref, 'title': profile.server };
+			if (profile.ref === selectedDns)
+				attrs.selected = 'selected';
+			return E('option', attrs, [ profile.label ]);
+		}));
+		if (selectedDns === 'manual')
+			dnsOptions.push(E('option', { 'value': 'manual', 'selected': 'selected', 'disabled': 'disabled' }, [ 'manual' ]));
 
-		return E('tr', {
-			'style': client.active ? 'background:rgba(22,163,74,.08);' : ''
-		}, [
+		return E('tr', stripedRowAttrs(index || 0, client.active ? 'background:rgba(22,163,74,.12);' : ''), [
 			E('td', {}, [ client.label ]),
 			E('td', {}, [ client.ip ]),
 			E('td', {}, [ routeBadge(client.active) ]),
@@ -1786,12 +2931,26 @@ return view.extend({
 					}
 				}, socksOptions)
 			]),
+			E('td', {}, [
+				E('select', {
+					'class': 'cbi-input-select',
+					'style': 'width:100%; min-width:10em; max-width:14em;',
+					'change': function(ev) {
+						return self.handleClientDnsChange(client, ev.target.value);
+					}
+				}, dnsOptions)
+			]),
 			E('td', {
 				'id': 'sockroute-client-traffic-%s'.format(domId(client.ip)),
 				'title': trafficTitle(client),
 				'style': 'white-space:nowrap;'
 			}, [ trafficCellContent(client) ]),
 			E('td', { 'class': 'right' }, [
+				!this.autoApply ? E('span', {
+					'id': 'sockroute-client-pending-%s'.format(domId(client.ip)),
+					'class': 'ifacebadge inactive',
+					'style': 'margin-right:6px;'
+				}, [ '' ]) : '',
 				E('button', {
 					'class': 'btn cbi-button-edit',
 					'click': ui.createHandlerFn(this, 'handleEditClient', client, this.socksProfiles || [], this.socksCandidates || [], this.defaultSocksHost || '', this.defaultSocksPort || '')
@@ -1827,9 +2986,12 @@ return view.extend({
 		var hiddenClients = asList(uci.get('sockroute', 'main', 'hidden_client'));
 		var clientCounters = parseClientCounters(runtime);
 		var socksProfiles = this.buildSocksProfiles();
+		var dnsProfiles = dnsProfilesFromUci();
 		var mainSocksRef = uci.get('sockroute', 'main', 'socks_ref') || '';
+		var mainDnsRef = uci.get('sockroute', 'main', 'dns_ref') || '';
 		var mainSocksProfile = findSocksProfile(socksProfiles, mainSocksRef);
 		var listenPort = uci.get('sockroute', 'main', 'listen_port') || '1042';
+		var defaultDnsServer = uci.get('sockroute', 'main', 'default_dns_server') || ('udp://' + (uci.get('sockroute', 'main', 'realip_dns_addr') || '1.1.1.1'));
 		var socksHost = mainSocksProfile ? mainSocksProfile.host : uci.get('sockroute', 'main', 'socks_host') || uci.get('sockroute', 'main', 'passwall_socks_host') || '127.0.0.1';
 		var socksPort = mainSocksProfile ? mainSocksProfile.port : uci.get('sockroute', 'main', 'socks_port') || uci.get('sockroute', 'main', 'passwall_socks_port') || '1080';
 		var clients = this.buildClients(activeClients, hiddenClients, socksProfiles, clientCounters);
@@ -1838,13 +3000,17 @@ return view.extend({
 		var allowedSources = asList(uci.get('sockroute_api', 'main', 'allowed_source_ip'));
 		var targetCidr = uci.get('sockroute_api', 'main', 'allowed_target_cidr') || '192.168.1.0/24';
 		var apiToken = uci.get('sockroute_api', 'main', 'token') || '';
+		var autoApply = uci.get('sockroute', 'main', 'auto_apply') !== '0';
+		var checkLoop = uci.get('sockroute', 'main', 'check_loop') === '1';
+		var socksCheckInterval = intervalSeconds(uci.get('sockroute', 'main', 'socks_check_interval'), 30);
+		var dnsCheckInterval = intervalSeconds(uci.get('sockroute', 'main', 'dns_check_interval'), 30);
 		var root = apiRoot();
-		var haYaml = buildHomeAssistantYaml(clients, root, apiToken);
-		var apiExamplesText = buildApiExamplesText(clients, socksProfiles, root, apiToken);
-		var apiExamples = buildApiExamplesTable(clients, socksProfiles, root, apiToken);
 		var self = this;
+		var pendingClientCount = this.pendingClientChangeCount();
 		var socksStatus = mainSocksProfile ? mainSocksProfile.lastCheck || 'unknown' : 'unknown';
 		var socksDetail = (mainSocksProfile ? mainSocksProfile.label + ' / ' : '') + socksHost + ':' + socksPort;
+		var socksAggregate = aggregateProfilesStatus(socksProfiles, 'SOCKS');
+		var dnsAggregate = aggregateProfilesStatus(dnsProfiles, 'DNS');
 		var statusCards;
 		var knownClientIps = {};
 		var profileUsage = {};
@@ -1853,27 +3019,29 @@ return view.extend({
 		var currentSocksCandidate = null;
 		this.socksCandidates = socksCandidates;
 		this.socksProfiles = socksProfiles;
+		this.dnsProfiles = dnsProfiles;
 		this.defaultSocksHost = socksHost;
 		this.defaultSocksPort = socksPort;
 		this.defaultSocksRef = mainSocksRef;
-		if (socksStatus === 'fail')
-			socksStatus = 'warn';
+		this.autoApply = autoApply;
 		if (mainSocksProfile && mainSocksProfile.lastCheckDetail)
 			socksDetail += ' / ' + mainSocksProfile.lastCheckDetail;
 		statusCards = [
 			{ key: 'service', label: 'Сервис', status: running ? 'ok' : 'warn', detail: running ? 'sockroute запущен' : 'sockroute остановлен' },
-			{ key: 'socks', label: 'SOCKS', status: socksStatus, detail: socksDetail },
+			{ key: 'socks', label: 'SOCKS', status: socksAggregate.status, detail: socksAggregate.detail },
+			{ key: 'dns', label: 'DNS', status: dnsAggregate.status, detail: dnsAggregate.detail },
 			{ key: 'runtime', label: 'Runtime', status: running ? 'ok' : 'warn', detail: 'порт ' + listenPort + ' / set ' + nftSet },
 			{ key: 'clients', label: 'Клиенты ON', status: activeClients.length ? 'ok' : 'unknown', detail: String(activeClients.length) },
 			{ key: 'api', label: 'API', status: allowedSources.length ? 'ok' : 'warn', detail: allowedSources.length ? allowedSources.join(', ') + (apiToken ? ' / token' : '') : 'нет разрешённых IP' }
 		];
 		var clientTable = [
-			E('tr', { 'class': 'tr table-titles' }, [
+			E('tr', stripedHeaderAttrs(), [
 				E('th', {}, [ 'Название' ]),
 				E('th', {}, [ 'IP' ]),
 				E('th', {}, [ 'Состояние' ]),
 				E('th', {}, [ 'Источник' ]),
-				E('th', {}, [ 'SOCKS outbound' ]),
+			E('th', {}, [ 'Исходящие SOCKS' ]),
+				E('th', {}, [ 'DNS' ]),
 				E('th', {}, [ 'Трафик' ]),
 				E('th', {}, [ '' ])
 			])
@@ -1893,6 +3061,7 @@ return view.extend({
 			E('option', { 'value': '' }, [ 'Выбрать найденный SOCKS...' ])
 		].concat(socksCandidates.map(function(candidate) {
 			var value = rawSocksValue(candidate.host, candidate.port);
+			var endpointValue = '%s:%s'.format(candidate.host, candidate.port);
 			var badge = socksCandidateBadge(candidate);
 			var text = '%s:%s - [%s] %s'.format(candidate.host, candidate.port, badge, candidate.label);
 			if (candidate.source)
@@ -1900,10 +3069,12 @@ return view.extend({
 
 			socksWarnings[value] = socksCandidateWarning(candidate);
 			socksLabels[value] = candidate.label || '%s:%s'.format(candidate.host, candidate.port);
+			socksWarnings[endpointValue] = socksWarnings[value];
+			socksLabels[endpointValue] = socksLabels[value];
 			return E('option', { 'value': value }, [ text ]);
 		}));
 		var socksProfileRows = [
-			E('tr', { 'class': 'tr table-titles' }, [
+			E('tr', stripedHeaderAttrs(), [
 				E('th', { 'style': 'width:11em;' }, [ 'Название' ]),
 				E('th', { 'style': 'width:12em;' }, [ 'Endpoint' ]),
 				E('th', { 'style': 'width:6em;' }, [ 'Проверка' ]),
@@ -1911,7 +3082,7 @@ return view.extend({
 				E('th', {}, [ 'Использование' ]),
 				E('th', { 'style': 'width:23em;' }, [ '' ])
 			])
-		].concat(socksProfiles.map(function(profile) {
+		].concat(socksProfiles.map(function(profile, index) {
 			var isDefault = profile.section === mainSocksRef;
 			var check = profile.lastCheck || 'unknown';
 			var usage = profileUsage[profile.section] || usageData();
@@ -1927,7 +3098,7 @@ return view.extend({
 			if (isDefault)
 				defaultButtonAttrs.disabled = 'disabled';
 
-			return E('tr', {}, [
+			return E('tr', stripedRowAttrs(index), [
 				E('td', { 'style': 'max-width:11em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, [
 					isDefault ? E('span', { 'class': 'ifacebadge' }, [ 'default' ]) : '',
 					isDefault ? ' ' : '',
@@ -1974,6 +3145,63 @@ return view.extend({
 				])
 			]);
 		}));
+		var dnsProfileRows = [
+			E('tr', stripedHeaderAttrs(), [
+				E('th', { 'style': 'width:12em;' }, [ 'Название' ]),
+				E('th', {}, [ 'Server' ]),
+				E('th', { 'style': 'width:6em;' }, [ 'Проверка' ]),
+				E('th', {}, [ 'Детали' ]),
+				E('th', { 'style': 'width:23em;' }, [ '' ])
+			])
+		].concat(dnsProfiles.map(function(profile, index) {
+			var isDefault = profile.section === mainDnsRef || (!mainDnsRef && profile.server === defaultDnsServer);
+			var defaultButtonAttrs = {
+				'class': 'btn cbi-button-apply',
+				'click': ui.createHandlerFn(self, 'handleSaveDnsRef', profile.section)
+			};
+			var rowKey = domId(profile.section);
+			if (isDefault)
+				defaultButtonAttrs.disabled = 'disabled';
+
+			return E('tr', stripedRowAttrs(index), [
+				E('td', { 'style': 'max-width:12em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, [
+					isDefault ? E('span', { 'class': 'ifacebadge' }, [ 'default' ]) : '',
+					isDefault ? ' ' : '',
+					profile.label
+				]),
+				E('td', { 'style': 'white-space:nowrap;' }, [ E('code', {}, [ profile.server ]) ]),
+				E('td', {
+					'id': 'sockroute-dns-status-%s'.format(rowKey),
+					'title': dnsProfileCheckTitle(profile)
+				}, [ statusBadge(profile.lastCheck || 'unknown') ]),
+				E('td', {
+					'id': 'sockroute-dns-detail-%s'.format(rowKey),
+					'title': dnsProfileCheckTitle(profile),
+					'style': 'max-width:26em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;'
+				}, [ profile.lastCheckDetail || 'не проверялся' ]),
+				E('td', {
+					'class': 'right',
+					'style': 'white-space:nowrap; min-width:23em;'
+				}, [
+					E('button', defaultButtonAttrs, [ 'По умолчанию' ]),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-action',
+						'click': ui.createHandlerFn(self, 'handleTestDnsProfile', profile)
+					}, [ 'Проверить' ]),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-edit',
+						'click': ui.createHandlerFn(self, 'handleEditDnsProfile', profile)
+					}, [ 'Edit' ]),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-negative',
+						'click': ui.createHandlerFn(self, 'handleDeleteDnsProfile', profile)
+					}, [ 'Удалить' ])
+				])
+			]);
+		}));
 		var dhcpRows;
 
 		clients.forEach(function(client) {
@@ -1981,14 +3209,14 @@ return view.extend({
 		});
 
 		dhcpRows = [
-			E('tr', { 'class': 'tr table-titles' }, [
+			E('tr', stripedHeaderAttrs(), [
 				E('th', {}, [ '' ]),
 				E('th', {}, [ 'Название' ]),
 				E('th', {}, [ 'IP' ]),
 				E('th', {}, [ 'MAC' ]),
 				E('th', {}, [ 'Статус' ])
 			])
-		].concat(dhcpHosts.map(function(lease) {
+		].concat(dhcpHosts.map(function(lease, index) {
 			var known = !!knownClientIps[lease.ip];
 			var checkboxAttrs = {
 				'type': 'checkbox',
@@ -1998,7 +3226,7 @@ return view.extend({
 			};
 			if (known)
 				checkboxAttrs.disabled = 'disabled';
-			return E('tr', {}, [
+			return E('tr', stripedRowAttrs(index), [
 				E('td', {}, [
 					E('input', checkboxAttrs)
 				]),
@@ -2017,14 +3245,57 @@ return view.extend({
 		}));
 
 		if (typeof(window) !== 'undefined') {
-			scheduleBackgroundChecks(socksProfiles, clients);
+			scheduleBackgroundChecks(socksProfiles, dnsProfiles, clients, socksCheckInterval, dnsCheckInterval, checkLoop);
 			scheduleDeferredDataLoad(this);
 		}
 
 		return E('div', { 'id': 'sockroute-root', 'class': 'cbi-map' }, [
 				E('h2', {}, [ 'SockRoute' ]),
-				E('div', { 'class': 'cbi-map-descr' }, [
-					'Ручная маршрутизация выбранных клиентов: TCP/UDP трафик IP из списка nft перенаправляется в отдельный transparent sing-box, а он отправляет его в выбранный SOCKS outbound. Основной proxy stack при переключении клиентов не перезапускается.'
+				E('div', { 'class': 'right', 'style': 'margin:8px 0 12px;' }, [
+					E('button', {
+						'class': running ? 'btn cbi-button-reset' : 'btn cbi-button-apply',
+						'click': ui.createHandlerFn(this, 'handleService', running ? 'stop' : 'start')
+					}, [ running ? 'Остановить' : 'Запустить' ]),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-reload',
+						'click': ui.createHandlerFn(this, 'handleService', 'restart')
+					}, [ 'Перезапустить' ]),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-action',
+						'click': ui.createHandlerFn(this, 'handleDiagnostics')
+					}, [ 'Диагностика' ]),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-action',
+						'click': ui.createHandlerFn(this, 'handleSettingsModal', {
+							allowedSources: allowedSources,
+							targetCidr: targetCidr,
+							apiToken: apiToken,
+							autoApply: autoApply,
+							checkLoop: checkLoop,
+							socksCheckInterval: socksCheckInterval,
+							dnsCheckInterval: dnsCheckInterval,
+							clients: clients,
+							socksProfiles: socksProfiles,
+							apiRoot: root,
+							runtime: runtime,
+							runtimeError: runtimeError,
+							deferredLoaded: deferredLoaded
+						})
+					}, [ 'Настройки' ]),
+					!autoApply ? ' ' : '',
+					!autoApply ? E('span', {
+						'id': 'sockroute-pending-client-count',
+						'style': 'margin-right:8px;'
+					}, [ pendingClientCount ? 'Ожидают сохранения: %d'.format(pendingClientCount) : '' ]) : '',
+					!autoApply ? E('button', {
+						'id': 'sockroute-save-pending-clients',
+						'class': 'btn cbi-button-save important',
+						'disabled': pendingClientCount ? null : 'disabled',
+						'click': ui.createHandlerFn(this, 'handleSavePendingClientChanges')
+					}, [ 'Сохранить' ]) : ''
 				]),
 
 				E('div', { 'class': 'cbi-section' }, [
@@ -2032,281 +3303,50 @@ return view.extend({
 					E('div', { 'class': running ? 'alert-message success' : 'alert-message warning' }, [
 						running ? 'Сервис запущен.' : 'Сервис остановлен.'
 					]),
-					buildStatusSummary(statusCards),
-					E('div', { 'class': 'right' }, [
-						E('button', {
-							'class': 'btn cbi-button-apply',
-							'click': ui.createHandlerFn(this, 'handleService', 'start')
-						}, [ 'Запустить' ]),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-reload',
-							'click': ui.createHandlerFn(this, 'handleService', 'restart')
-						}, [ 'Перезапустить сервис' ]),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-reset',
-							'click': ui.createHandlerFn(this, 'handleService', 'stop')
-						}, [ 'Остановить' ]),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-action',
-							'click': ui.createHandlerFn(this, 'handleSetup')
-						}, [ 'Обновить runtime' ]),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-action',
-							'click': ui.createHandlerFn(this, 'handleDiagnostics')
-						}, [ 'Диагностика' ])
-					])
+					buildStatusSummary(statusCards)
 				]),
 
 				E('div', { 'class': 'cbi-section' }, [
-					E('h3', {}, [ 'SOCKS outbound' ]),
-				E('div', { 'class': 'cbi-section-descr' }, [
-					'Глобальный SOCKS для клиентов SockRoute. Можно выбрать найденный SOCKS или указать IP и порт вручную; применяется перезапуском только SockRoute. Для отдельного клиента SOCKS можно переопределить через Edit.'
-				]),
+				E('h3', {}, [ 'Исходящие SOCKS' ]),
 				socksProfiles.length ? E('div', { 'style': 'max-height: 320px; overflow:auto; margin-bottom:12px;' }, [
-					E('table', { 'class': 'table cbi-section-table' }, socksProfileRows)
+					E('table', dataTableAttrs('cbi-section-table'), socksProfileRows)
 				]) : E('p', {}, [ E('em', {}, [ 'Сохранённых SOCKS профилей пока нет.' ]) ]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-socks-candidate' }, [ 'SOCKS endpoint' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						!deferredLoaded ? E('em', {}, [ 'SOCKS endpoint загружаются после открытия страницы...' ]) : socksCandidates.length ? E('select', {
-							'id': 'sockroute-socks-candidate',
-							'class': 'cbi-input-select',
-							'style': 'width: 100%; max-width: 42em;',
-							'change': function(ev) {
-								fillSocksBuilder(ev.target.value, socksWarnings, socksLabels);
-							}
-						}, socksCandidateOptions) : E('em', {}, [ 'Кандидаты не найдены, можно указать endpoint вручную.' ])
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, [ 'Подсказка' ]),
-					E('div', {
-						'id': 'sockroute-socks-warning',
-						'class': 'cbi-value-field'
-					}, [ socksCandidateWarning(currentSocksCandidate) ])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-socks-label' }, [ 'Профиль' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', {
-							'id': 'sockroute-socks-label',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'style': 'width:100%; max-width:18em;',
-							'placeholder': 'Название нового профиля'
-						}),
-						' ',
-						E('input', {
-							'id': 'sockroute-socks-host',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'style': 'width: 100%; max-width: 14em;',
-							'value': socksHost,
-							'placeholder': 'SOCKS IP'
-						}),
-						' ',
-						E('input', {
-							'id': 'sockroute-socks-port',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'style': 'width: 8em;',
-							'value': socksPort,
-							'placeholder': 'порт'
-						}),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-add',
-							'title': 'Создать сохранённый SOCKS профиль из указанного endpoint',
-							'click': ui.createHandlerFn(this, 'handleAddSocksProfile')
-						}, [ 'Добавить профиль' ]),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-save',
-							'title': 'Сделать указанный endpoint SOCKS по умолчанию и перезапустить только SockRoute',
-							'click': ui.createHandlerFn(this, 'handleSaveSocks')
-						}, [ 'Сделать default' ]),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-action',
-							'click': ui.createHandlerFn(this, 'handleTestSocksManual', 'sockroute-socks-host', 'sockroute-socks-port')
-						}, [ 'Проверить' ])
-					])
+				E('div', { 'class': 'right' }, [
+					!deferredLoaded ? E('em', { 'style': 'margin-right:8px;' }, [ 'SOCKS endpoint загружаются...' ]) : '',
+					E('button', {
+						'class': 'btn cbi-button-add',
+						'disabled': !deferredLoaded ? 'disabled' : null,
+						'click': ui.createHandlerFn(this, 'handleAddSocksProfileModal', socksCandidates, socksHost, socksPort, socksWarnings, socksLabels)
+					}, [ 'Добавить' ])
+				])
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ 'DNS профили' ]),
+				dnsProfiles.length ? E('div', { 'style': 'max-height:320px; overflow:auto; margin-bottom:12px;' }, [
+					E('table', dataTableAttrs('cbi-section-table'), dnsProfileRows)
+				]) : E('p', {}, [ E('em', {}, [ 'DNS профилей пока нет.' ]) ]),
+				E('div', { 'class': 'right' }, [
+					E('button', {
+						'class': 'btn cbi-button-add',
+						'click': ui.createHandlerFn(this, 'handleEditDnsProfile', null)
+					}, [ 'Добавить' ])
 				])
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, [ 'Клиенты' ]),
-				E('table', { 'class': 'table cbi-section-table' }, clientTable)
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ 'Добавить клиента' ]),
-				E('div', { 'class': 'cbi-section-descr' }, [
-					'Одиночное добавление и массовый импорт используют один источник: закреплённые DHCP host-записи из /etc/config/dhcp.'
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-dhcp-picker' }, [ 'DHCP host-запись' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						!deferredLoaded ? E('em', {}, [ 'DHCP host-записи загружаются после открытия страницы...' ]) : dhcpHosts.length ? E('select', {
-							'id': 'sockroute-dhcp-picker',
-							'class': 'cbi-input-select',
-							'style': 'width:100%; max-width:42em;',
-							'change': function(ev) {
-								fillClientFromDhcp(ev.target.value);
-							}
-						}, dhcpOptions) : E('em', {}, [ 'Закреплённые DHCP host-записи не найдены.' ])
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-label' }, [ 'Название' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', {
-							'id': 'sockroute-label',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'placeholder': 'Телевизор'
-						})
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-ip' }, [ 'IP клиента' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', {
-							'id': 'sockroute-ip',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'placeholder': '192.168.1.100'
-						}),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-add',
-							'click': ui.createHandlerFn(this, 'handleAddManual')
-						}, [ 'Добавить и ON' ])
-					])
-				]),
-				E('details', { 'style': 'margin-top:12px;' }, [
-					E('summary', {
-						'style': 'cursor:pointer; display:inline-block; padding:4px 10px; border-radius:4px; border:1px solid rgba(127,127,127,.45); font-weight:700;'
-					}, [ 'Импорт из DHCP' ]),
-					E('div', { 'class': 'cbi-section-descr', 'style': 'margin-top:8px;' }, [
-						'Выберите несколько закреплённых DHCP host-записей и добавьте их в профиль или сразу включите SockRoute.'
-					]),
-					!deferredLoaded ? E('em', {}, [ 'DHCP host-записи загружаются после открытия страницы...' ]) : dhcpHosts.length ? E('div', {}, [
-						E('div', { 'class': 'right' }, [
-							E('button', {
-								'class': 'btn cbi-button-add',
-								'click': ui.createHandlerFn(this, 'handleImportDhcp', false)
-							}, [ 'Добавить выбранные' ]),
-							' ',
-							E('button', {
-								'class': 'btn cbi-button-apply',
-								'click': ui.createHandlerFn(this, 'handleImportDhcp', true)
-							}, [ 'Добавить выбранные и ON' ])
-						]),
-						E('div', { 'style': 'max-height:360px; overflow:auto;' }, [
-							E('table', { 'class': 'table cbi-section-table' }, dhcpRows)
-						])
-					]) : E('em', {}, [ 'Закреплённые DHCP host-записи не найдены.' ])
-				])
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ 'API' ]),
-				E('div', { 'class': 'cbi-section-descr' }, [
-					'HTTP API принимает запросы только с разрешённых IP. Token необязателен; если он задан, его нужно передавать в URL или заголовке X-SockRoute-Token.'
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-api-allowed-sources' }, [ 'Разрешённые IP' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', {
-							'id': 'sockroute-api-allowed-sources',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'style': 'min-width: 28em;',
-							'value': allowedSources.join(' '),
-							'placeholder': '192.168.1.2 192.168.1.3'
-						})
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-api-target-cidr' }, [ 'Сеть клиентов' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', {
-							'id': 'sockroute-api-target-cidr',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'style': 'min-width: 12em;',
-							'value': targetCidr,
-							'placeholder': '192.168.1.0/24'
-						})
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'sockroute-api-token' }, [ 'API token' ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', {
-							'id': 'sockroute-api-token',
-							'type': 'text',
-							'class': 'cbi-input-text',
-							'style': 'width: 100%; max-width: 28em;',
-							'value': apiToken,
-							'placeholder': 'пусто: проверка только по IP'
-						}),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-action',
-							'click': ui.createHandlerFn(this, 'handleGenerateApiToken')
-						}, [ 'Сгенерировать' ]),
-						' ',
-						E('button', {
-							'class': 'btn cbi-button-save',
-							'click': ui.createHandlerFn(this, 'handleSaveApi')
-						}, [ 'Сохранить API' ])
-					])
-				]),
-				buildApiHelp(clients, socksProfiles, root, apiToken),
-				E('details', {}, [
-					E('summary', { 'style': 'cursor: pointer; font-weight: bold;' }, [ 'Примеры API URL' ]),
-					E('div', { 'class': 'cbi-section-descr' }, [
-						'URL генерируются по текущему списку клиентов, текущему адресу LuCI и сохранённым SOCKS outbound. В примерах есть совместимые ON/OFF и варианты с outbound.'
-					]),
+				E('table', dataTableAttrs('cbi-section-table'), clientTable),
+				E('div', { 'class': 'right', 'style': 'margin-top:8px;' }, [
+					!deferredLoaded ? E('em', { 'style': 'margin-right:8px;' }, [ 'DHCP host-записи загружаются...' ]) : '',
 					E('button', {
-						'class': 'btn cbi-button-action',
-						'click': function() {
-							return copyText(apiExamplesText, 'API URL скопированы.');
-						}
-					}, [ 'Копировать все URL' ]),
-					apiExamples
+						'class': 'btn cbi-button-add',
+						'click': ui.createHandlerFn(this, 'handleAddClientModal', deferredLoaded, dhcpHosts, dhcpOptions, dhcpRows)
+					}, [ 'Добавить' ])
 				])
 			]),
 
-			E('details', { 'class': 'cbi-section' }, [
-				E('summary', { 'style': 'cursor: pointer; font-weight: bold;' }, [ 'Home Assistant command_line' ]),
-				E('div', { 'class': 'cbi-section-descr' }, [
-					'YAML генерируется по текущему списку клиентов. После добавления, удаления или редактирования клиента этот блок автоматически меняется.'
-				]),
-				E('button', {
-					'class': 'btn cbi-button-action',
-					'click': function() {
-						return copyText(haYaml, 'Home Assistant YAML скопирован.');
-					}
-				}, [ 'Копировать YAML' ]),
-				E('pre', { 'style': 'white-space: pre-wrap; max-height: 360px; overflow: auto;' }, [ haYaml ])
-			]),
-
-			E('details', { 'class': 'cbi-section' }, [
-				E('summary', { 'style': 'cursor: pointer; font-weight: bold;' }, [ 'Runtime set' ]),
-				E('pre', {
-					'id': 'sockroute-runtime-pre',
-					'style': 'white-space: pre-wrap; max-height: 320px; overflow: auto;'
-				}, [
-					runtime || runtimeError || (deferredLoaded ? 'Нет runtime-данных.' : 'Runtime-данные загружаются после открытия страницы...')
-				])
-			])
+			''
 		]);
 	},
 

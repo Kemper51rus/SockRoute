@@ -6,6 +6,9 @@ SECTION="main"
 LOCK_FILE="/var/lock/sockroute.lock"
 NAT_HOOK_COMMENT="sockroute_tcp_hook"
 MANGLE_HOOK_COMMENT="sockroute_udp_hook"
+SOCKROUTE_DNS_UDP_COMMENT="sockroute_dns_realip_udp"
+SOCKROUTE_DNS_TCP_COMMENT="sockroute_dns_realip_tcp"
+SOCKROUTE_DNS_HIJACK_COMMENT="sockroute_dns_hijack"
 LEGACY_NAT_HOOK_COMMENT="force_vpn_tcp_hook"
 LEGACY_MANGLE_HOOK_COMMENT="force_vpn_udp_hook"
 
@@ -53,6 +56,35 @@ validate_port() {
 	return 0
 }
 
+ip4_to_int() {
+	old_ifs="$IFS"
+	IFS=.
+	set -- $1
+	IFS="$old_ifs"
+	printf '%s' $((($1 * 16777216) + ($2 * 65536) + ($3 * 256) + $4))
+}
+
+ip4_in_cidr() {
+	cidr_ip="$1"
+	cidr_value="$2"
+	validate_ip4 "$cidr_ip" || return 1
+	case "$cidr_value" in
+		*/*) cidr_network="${cidr_value%/*}"; cidr_prefix="${cidr_value#*/}" ;;
+		*) cidr_network="$cidr_value"; cidr_prefix=32 ;;
+	esac
+	validate_ip4 "$cidr_network" || return 1
+	case "$cidr_prefix" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$cidr_prefix" -ge 0 ] 2>/dev/null && [ "$cidr_prefix" -le 32 ] || return 1
+	cidr_ip_int="$(ip4_to_int "$cidr_ip")"
+	cidr_network_int="$(ip4_to_int "$cidr_network")"
+	if [ "$cidr_prefix" -eq 0 ]; then
+		cidr_mask=0
+	else
+		cidr_mask=$(( (0xffffffff << (32 - cidr_prefix)) & 0xffffffff ))
+	fi
+	[ $((cidr_ip_int & cidr_mask)) -eq $((cidr_network_int & cidr_mask)) ]
+}
+
 validate_socks_host() {
 	validate_ip4 "$1"
 }
@@ -91,10 +123,121 @@ nat_chain() { cfg nft_nat_chain SOCKROUTE_NAT; }
 mangle_chain() { cfg nft_mangle_chain SOCKROUTE_MANGLE; }
 nat_hook_chain() { cfg nft_nat_hook_chain dstnat; }
 mangle_hook_chain() { cfg nft_mangle_hook_chain mangle_prerouting; }
+dns_chain() { cfg nft_dns_chain PSW2_DNS; }
+realip_dns_enabled() {
+	case "$(cfg realip_dns 1)" in
+		0|no|false|off) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+realip_dns_addr() {
+	addr="$(cfg realip_dns_addr 1.1.1.1)"
+	validate_ip4 "$addr" && printf '%s\n' "$addr" || printf '1.1.1.1\n'
+}
+default_dns_server() {
+	default_dns_ref="$(cfg dns_ref "")"
+	if [ -n "$default_dns_ref" ] && dns_profile_exists "$default_dns_ref"; then
+		default_dns_profile_server="$(dns_profile_server "$default_dns_ref" || true)"
+		if [ -n "$default_dns_profile_server" ] && validate_dns_server_spec "$default_dns_profile_server"; then
+			printf '%s' "$default_dns_profile_server"
+			return
+		fi
+	fi
+	default_dns_value="$(cfg default_dns_server "")"
+	if [ -n "$default_dns_value" ] && validate_dns_server_spec "$default_dns_value"; then
+		printf '%s' "$default_dns_value"
+	else
+		printf 'udp://%s' "$(realip_dns_addr)"
+	fi
+}
+dns_standard_server() { cfg dns_standard_server 100.100.0.217; }
+dns_unblock_server() { cfg dns_unblock_server 100.100.0.156; }
+dns_profile_server() {
+	if dns_profile_exists "$1"; then
+		uci -q get "$CONFIG.$1.server" 2>/dev/null || true
+		return
+	fi
+	case "$1" in
+		standard) dns_standard_server ;;
+		unblock) dns_unblock_server ;;
+		default|"") default_dns_server ;;
+		*) return 1 ;;
+	esac
+}
+dns_port() { cfg dns_port 1053; }
+dns_check_domain() { cfg dns_check_domain one.one.one.one; }
+dns_check_timeout() {
+	timeout_value="$(cfg dns_check_timeout 5)"
+	case "$timeout_value" in
+		""|*[!0-9]*) printf '5' ;;
+		*) [ "$timeout_value" -ge 1 ] 2>/dev/null && [ "$timeout_value" -le 30 ] && printf '%s' "$timeout_value" || printf '5' ;;
+	esac
+}
+transparent_port() { cfg transparent_port "$(cfg listen_port 1042)"; }
 lan_if() { cfg lan_if br-lan; }
 lan_cidr() { cfg lan_cidr 192.168.1.0/24; }
 listen_port() { cfg listen_port 1042; }
 nft_mark() { cfg nft_mark 0x50535732; }
+
+delete_dns_realip_rules() {
+	dns="$(dns_chain)"
+	delete_hook_rules "$dns" "$SOCKROUTE_DNS_UDP_COMMENT"
+	delete_hook_rules "$dns" "$SOCKROUTE_DNS_TCP_COMMENT"
+	delete_hook_rules "$dns" "$SOCKROUTE_DNS_HIJACK_COMMENT"
+}
+
+add_dns_realip_rules() {
+	fam="$1"
+	tbl="$2"
+	set="$3"
+	dns="$(dns_chain)"
+
+	nft list chain "$fam" "$tbl" "$dns" >/dev/null 2>&1 || return 0
+	delete_dns_realip_rules
+	realip_dns_enabled || return 0
+	port="$(dns_port)"
+	validate_port "$port" || port=1053
+	nft insert rule "$fam" "$tbl" "$dns" position 0 \
+		ip saddr "@$set" ip protocol tcp tcp dport 53 \
+		counter redirect to ":$port" comment "$SOCKROUTE_DNS_TCP_COMMENT"
+	nft insert rule "$fam" "$tbl" "$dns" position 0 \
+		ip saddr "@$set" ip protocol udp udp dport 53 \
+		counter redirect to ":$port" comment "$SOCKROUTE_DNS_UDP_COMMENT"
+}
+
+add_sockroute_dns_hijack_rules() {
+	fam="$1"
+	tbl="$2"
+	set="$3"
+	nat="$4"
+	mangle="$5"
+	lan="$6"
+
+	realip_dns_enabled || return 0
+	port="$(dns_port)"
+	validate_port "$port" || port=1053
+
+	nft add rule "$fam" "$tbl" "$mangle" \
+		iifname "$lan" ip saddr "@$set" ip protocol udp udp dport 53 \
+		counter return comment "$SOCKROUTE_DNS_HIJACK_COMMENT"
+	nft add rule "$fam" "$tbl" "$nat" \
+		iifname "$lan" ip saddr "@$set" ip protocol udp udp dport 53 \
+		counter redirect to ":$port" comment "$SOCKROUTE_DNS_HIJACK_COMMENT"
+	nft add rule "$fam" "$tbl" "$nat" \
+		iifname "$lan" ip saddr "@$set" ip protocol tcp tcp dport 53 \
+		counter redirect to ":$port" comment "$SOCKROUTE_DNS_HIJACK_COMMENT"
+}
+
+sockroute_dns_hijack_ready() {
+	fam="$(family)"
+	tbl="$(table)"
+	nat="$(nat_chain)"
+	mangle="$(mangle_chain)"
+
+	nft list chain "$fam" "$tbl" "$nat" 2>/dev/null | grep -q "$SOCKROUTE_DNS_HIJACK_COMMENT" || return 1
+	nft list chain "$fam" "$tbl" "$mangle" 2>/dev/null | grep -q "$SOCKROUTE_DNS_HIJACK_COMMENT" || return 1
+	return 0
+}
 
 raw_socks_host() {
 	uci -q get "$CONFIG.$SECTION.socks_host" 2>/dev/null ||
@@ -147,6 +290,45 @@ next_socks_profile_section_name() {
 	host="$1"
 	port="$2"
 	base="$(socks_profile_section_name "$host" "$port")"
+	candidate="$base"
+	index=2
+
+	while uci -q get "$CONFIG.$candidate" >/dev/null 2>&1; do
+		candidate="${base}_${index}"
+		index=$((index + 1))
+	done
+
+	printf '%s' "$candidate"
+}
+
+dns_profile_sections() {
+	uci show "$CONFIG" 2>/dev/null | sed -n "s/^$CONFIG\.\([^.]*\)=dns$/\1/p"
+}
+
+dns_profile_exists() {
+	ref="$1"
+	[ -n "$ref" ] || return 1
+	for section in $(dns_profile_sections); do
+		[ "$section" = "$ref" ] && return 0
+	done
+	return 1
+}
+
+dns_profile_label() {
+	ref="$1"
+	dns_profile_exists "$ref" || return 1
+	uci -q get "$CONFIG.$ref.label" 2>/dev/null || printf '%s' "$ref"
+}
+
+dns_profile_section_name() {
+	label="$1"
+	printf 'dns_%s' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g; s/__*/_/g; s/^_//; s/_$//')"
+}
+
+next_dns_profile_section_name() {
+	label="$1"
+	base="$(dns_profile_section_name "$label")"
+	[ -n "$base" ] && [ "$base" != "dns_" ] || base="dns_profile"
 	candidate="$base"
 	index=2
 
@@ -219,6 +401,243 @@ client_socks_port() {
 
 client_socks_tag() {
 	printf 'client_%s_socks' "$(ip_token "$1")"
+}
+
+dns_server_tag() {
+	printf 'client_%s_dns_%s' "$(ip_token "$1")" "$2"
+}
+
+is_hostname() {
+	value="$1"
+	case "$value" in
+		""|*[^A-Za-z0-9.-]*|.*|*.|*..*) return 1 ;;
+	esac
+	case "$value" in
+		*.*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+parse_dns_server_spec() {
+	spec="$1"
+	proto=udp
+	server="$spec"
+	port=""
+	path=""
+	case "$spec" in
+		udp://*) proto=udp; server="${spec#udp://}" ;;
+		tls://*) proto=tls; server="${spec#tls://}" ;;
+		https://*) proto=https; server="${spec#https://}" ;;
+	esac
+	case "$proto" in
+		https)
+			case "$server" in
+				*/*) path="/${server#*/}"; server="${server%%/*}" ;;
+				*) path="/dns-query" ;;
+			esac
+			;;
+	esac
+	case "$server" in
+		*:*) port="${server##*:}"; server="${server%:*}" ;;
+	esac
+	case "$proto" in
+		udp) [ -n "$port" ] || port=53 ;;
+		tls) [ -n "$port" ] || port=853 ;;
+		https) [ -n "$port" ] || port=443 ;;
+	esac
+	printf '%s\t%s\t%s\t%s\n' "$proto" "$server" "$port" "$path"
+}
+
+validate_dns_server_spec() {
+	parsed="$(parse_dns_server_spec "$1")"
+	old_ifs="$IFS"
+	IFS=' '
+	set -- $(printf '%s' "$parsed" | tr '\t' ' ')
+	IFS="$old_ifs"
+	proto="$1"; server="$2"; port="$3"
+	case "$proto" in udp|tls|https) ;; *) return 1 ;; esac
+	validate_ip4 "$server" || is_hostname "$server" || return 1
+	validate_port "$port" || return 1
+	return 0
+}
+
+dns_server_host_from_spec() {
+	parsed="$(parse_dns_server_spec "$1")"
+	old_ifs="$IFS"
+	IFS=' '
+	set -- $(printf '%s' "$parsed" | tr '\t' ' ')
+	IFS="$old_ifs"
+	printf '%s' "$2"
+}
+
+dns_server_is_lan() {
+	host="$(dns_server_host_from_spec "$1")"
+	validate_ip4 "$host" || return 1
+	ip4_in_cidr "$host" "$(lan_cidr)"
+}
+
+client_dns_servers() {
+	client_section="$1"
+	uci -q get "$CONFIG.$client_section.dns_server" 2>/dev/null || true
+}
+
+client_dns_ref() {
+	client_section="$1"
+	uci -q get "$CONFIG.$client_section.dns_ref" 2>/dev/null || true
+}
+
+client_effective_dns_servers() {
+	client_section="$1"
+	dns_ref="$(client_dns_ref "$client_section")"
+	if [ -n "$dns_ref" ] && dns_profile_exists "$dns_ref"; then
+		dns_profile_server "$dns_ref"
+		return
+	fi
+	case "$dns_ref" in
+		standard|unblock)
+			dns_profile_server "$dns_ref"
+			return
+			;;
+	esac
+	client_dns_servers "$client_section"
+}
+
+client_has_effective_dns_servers() {
+	client_section="$1"
+	for dns_server in $(client_effective_dns_servers "$client_section"); do
+		validate_dns_server_spec "$dns_server" && return 0
+	done
+	return 1
+}
+
+set_client_dns() {
+	client_ip="$1"
+	shift || true
+	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
+	section="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$section" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
+
+	check_host="$(client_socks_host "$section")"
+	check_port="$(client_socks_port "$section")"
+	if ! validate_socks_host "$check_host" || ! validate_port "$check_port"; then
+		check_host="$(socks_host)"
+		check_port="$(socks_port)"
+	fi
+
+	index=1
+	for dns_server in "$@"; do
+		validate_dns_server_spec "$dns_server" || { printf 'ERROR: bad dns server: %s\n' "$dns_server" >&2; exit 1; }
+		check_port_value=$((18053 + (index % 1000)))
+		if dns_server_is_lan "$dns_server"; then
+			check_dns_server_direct "$dns_server" "$check_port_value" || {
+				printf 'ERROR: dns check failed direct: %s\n' "$dns_server" >&2
+				exit 1
+			}
+		else
+			check_dns_server_through_socks "$dns_server" "$check_host" "$check_port" "$check_port_value" || {
+				printf 'ERROR: dns check failed via %s:%s: %s\n' "$check_host" "$check_port" "$dns_server" >&2
+				exit 1
+			}
+		fi
+		index=$((index + 1))
+	done
+
+	uci -q delete "$CONFIG.$section.dns_server" 2>/dev/null || true
+	uci -q delete "$CONFIG.$section.dns_ref" 2>/dev/null || true
+	for dns_server in "$@"; do
+		uci add_list "$CONFIG.$section.dns_server=$dns_server"
+	done
+	uci commit "$CONFIG"
+	write_config
+}
+
+clear_client_dns() {
+	client_ip="$1"
+	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
+	section="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$section" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
+	uci -q delete "$CONFIG.$section.dns_server" 2>/dev/null || true
+	uci -q delete "$CONFIG.$section.dns_ref" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+}
+
+set_client_dns_ref() {
+	client_ip="$1"
+	dns_ref="$2"
+	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
+	section="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$section" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
+	case "$dns_ref" in default|"") clear_client_dns "$client_ip"; return ;; esac
+	dns_profile_exists "$dns_ref" || case "$dns_ref" in standard|unblock) ;; *) printf 'ERROR: bad dns ref\n' >&2; exit 1 ;; esac
+	dns_server="$(dns_profile_server "$dns_ref")"
+	validate_dns_server_spec "$dns_server" || { printf 'ERROR: bad dns profile server\n' >&2; exit 1; }
+	if dns_server_is_lan "$dns_server"; then
+		check_dns_server_direct "$dns_server" 18053 || {
+			printf 'ERROR: dns check failed direct: %s\n' "$dns_server" >&2
+			exit 1
+		}
+	else
+		check_host="$(client_socks_host "$section")"
+		check_port="$(client_socks_port "$section")"
+		if ! validate_socks_host "$check_host" || ! validate_port "$check_port"; then
+			check_host="$(socks_host)"
+			check_port="$(socks_port)"
+		fi
+		check_dns_server_through_socks "$dns_server" "$check_host" "$check_port" 18053 || {
+			printf 'ERROR: dns check failed via %s:%s: %s\n' "$check_host" "$check_port" "$dns_server" >&2
+			exit 1
+		}
+	fi
+	uci set "$CONFIG.$section.dns_ref=$dns_ref"
+	uci -q delete "$CONFIG.$section.dns_server" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+}
+
+set_default_dns() {
+	dns_server="${1:-}"
+	validate_dns_server_spec "$dns_server" || { printf 'ERROR: bad dns server\n' >&2; exit 1; }
+	uci set "$CONFIG.$SECTION.default_dns_server=$dns_server"
+	uci commit "$CONFIG"
+	write_config
+	log "updated SockRoute default DNS to $dns_server"
+}
+
+set_dns_profile() {
+	dns_ref="${1:-}"
+	label="${2:-}"
+	dns_server="${3:-}"
+	if [ -z "$dns_server" ]; then
+		dns_server="$label"
+		label="$dns_ref"
+	fi
+	validate_label "$label" || { printf 'ERROR: bad label\n' >&2; exit 1; }
+	validate_dns_server_spec "$dns_server" || { printf 'ERROR: bad dns server\n' >&2; exit 1; }
+	if [ -z "$dns_ref" ] || [ "$dns_ref" = "-" ]; then
+		dns_ref="$(next_dns_profile_section_name "$label")"
+	elif ! dns_profile_exists "$dns_ref"; then
+		case "$dns_ref" in
+			standard|unblock) ;;
+			*) dns_ref="$(next_dns_profile_section_name "$label")" ;;
+		esac
+	fi
+	case "$dns_ref" in
+		standard|unblock)
+			uci set "$CONFIG.$SECTION.dns_${dns_ref}_label=$label"
+			uci set "$CONFIG.$SECTION.dns_${dns_ref}_server=$dns_server"
+			;;
+		*)
+			uci set "$CONFIG.$dns_ref=dns"
+			uci set "$CONFIG.$dns_ref.label=$label"
+			uci set "$CONFIG.$dns_ref.server=$dns_server"
+			;;
+	esac
+	uci commit "$CONFIG"
+	test_dns_profile "$dns_ref" >/dev/null 2>&1 || true
+	write_config
+	log "updated SockRoute DNS profile $dns_ref to $dns_server"
+	printf '%s\n' "$dns_ref"
 }
 
 client_has_custom_socks() {
@@ -355,7 +774,7 @@ setup_nft() {
 	mangle_hook="$(mangle_hook_chain)"
 	lan="$(lan_if)"
 	cidr="$(lan_cidr)"
-	port="$(listen_port)"
+	transparent_listen_port="$(transparent_port)"
 	mark="$(nft_mark)"
 
 	nft list chain "$fam" "$tbl" "$nat_hook" >/dev/null
@@ -375,13 +794,16 @@ setup_nft() {
 		create_client_set "$fam" "$tbl" "$set"
 	fi
 
+	add_dns_realip_rules "$fam" "$tbl" "$set"
+	add_sockroute_dns_hijack_rules "$fam" "$tbl" "$set" "$nat" "$mangle" "$lan"
+
 	nft add rule "$fam" "$tbl" "$nat" \
 		iifname "$lan" ip saddr "@$set" ip daddr != "$cidr" ip protocol tcp \
-		counter redirect to ":$port" comment sockroute_tcp
+		counter redirect to ":$transparent_listen_port" comment sockroute_tcp
 
 	nft add rule "$fam" "$tbl" "$mangle" \
 		iifname "$lan" ip saddr "@$set" ip daddr != "$cidr" ip protocol udp \
-		counter meta mark set "$mark" ct mark set "$mark" tproxy ip to ":$port" \
+		counter meta mark set "$mark" ct mark set "$mark" tproxy ip to ":$transparent_listen_port" \
 		comment sockroute_udp
 
 	delete_hook_rules "$nat_hook" "$NAT_HOOK_COMMENT"
@@ -408,6 +830,7 @@ teardown_nft() {
 
 	delete_hook_rules "$nat_hook" "$NAT_HOOK_COMMENT"
 	delete_hook_rules "$mangle_hook" "$MANGLE_HOOK_COMMENT"
+	delete_dns_realip_rules
 	delete_hook_rules "$nat_hook" "$LEGACY_NAT_HOOK_COMMENT"
 	delete_hook_rules "$mangle_hook" "$LEGACY_MANGLE_HOOK_COMMENT"
 
@@ -423,16 +846,299 @@ teardown_nft() {
 	nft delete set "$fam" "$tbl" force_vpn_clients 2>/dev/null || true
 }
 
+emit_dns_server_json() {
+	config_file="$1"
+	tag="$2"
+	spec="$3"
+	detour="${4:-}"
+	parsed="$(parse_dns_server_spec "$spec")"
+	old_ifs="$IFS"
+	IFS=' '
+	set -- $(printf '%s' "$parsed" | tr '\t' ' ')
+	IFS="$old_ifs"
+	dns_proto="$1"; dns_server_host="$2"; dns_server_port="$3"; dns_path="${4:-}"
+	cat >> "$config_file" <<EOF
+    ,
+    {
+      "type": "$dns_proto",
+      "tag": "$tag",
+      "server": "$dns_server_host",
+      "server_port": $dns_server_port
+EOF
+	if [ -n "$detour" ]; then
+		cat >> "$config_file" <<EOF
+      ,
+      "detour": "$detour"
+EOF
+	fi
+	if ! validate_ip4 "$dns_server_host"; then
+		cat >> "$config_file" <<EOF
+      ,
+      "domain_resolver": "default_dns"
+EOF
+	fi
+	case "$dns_proto" in
+		tls)
+			cat >> "$config_file" <<EOF
+      ,
+      "tls": {
+        "enabled": true,
+        "server_name": "$dns_server_host"
+      }
+EOF
+			;;
+		https)
+			cat >> "$config_file" <<EOF
+      ,
+      "path": "$dns_path",
+      "tls": {
+        "enabled": true,
+        "server_name": "$dns_server_host"
+      }
+EOF
+			;;
+	esac
+	cat >> "$config_file" <<EOF
+    }
+EOF
+}
+
+emit_dns_server_object_json() {
+	config_file="$1"
+	tag="$2"
+	spec="$3"
+	indent="${4:-      }"
+	detour="${5:-direct}"
+	parsed="$(parse_dns_server_spec "$spec")"
+	old_ifs="$IFS"
+	IFS=' '
+	set -- $(printf '%s' "$parsed" | tr '\t' ' ')
+	IFS="$old_ifs"
+	dns_proto="$1"; dns_server_host="$2"; dns_server_port="$3"; dns_path="${4:-}"
+	printf '%s{\n' "$indent" >> "$config_file"
+	printf '%s  "type": "%s",\n' "$indent" "$dns_proto" >> "$config_file"
+	printf '%s  "tag": "%s",\n' "$indent" "$tag" >> "$config_file"
+	printf '%s  "server": "%s",\n' "$indent" "$dns_server_host" >> "$config_file"
+	printf '%s  "server_port": %s,\n' "$indent" "$dns_server_port" >> "$config_file"
+	printf '%s  "detour": "%s"' "$indent" "$detour" >> "$config_file"
+	if ! validate_ip4 "$dns_server_host"; then
+		printf ',\n%s  "domain_resolver": "bootstrap_dns"' "$indent" >> "$config_file"
+	fi
+	case "$dns_proto" in
+		tls)
+			printf ',\n%s  "tls": {\n%s    "enabled": true,\n%s    "server_name": "%s"\n%s  }' "$indent" "$indent" "$indent" "$dns_server_host" "$indent" >> "$config_file"
+			;;
+		https)
+			printf ',\n%s  "path": "%s",\n%s  "tls": {\n%s    "enabled": true,\n%s    "server_name": "%s"\n%s  }' "$indent" "$dns_path" "$indent" "$indent" "$indent" "$dns_server_host" "$indent" >> "$config_file"
+			;;
+	esac
+	printf '\n%s}' "$indent" >> "$config_file"
+}
+
+check_dns_server_through_socks() {
+	spec="$1"
+	socks_check_host="$2"
+	socks_check_port="$3"
+	check_port_value="$4"
+	check_domain="$(dns_check_domain)"
+	check_timeout="$(dns_check_timeout)"
+	sing_box_bin="$(cfg sing_box_bin /usr/bin/sing-box)"
+	check_config="/tmp/sockroute-dns-check-$$-$check_port_value.json"
+	check_output="/tmp/sockroute-dns-check-$$-$check_port_value.out"
+
+	[ -x "$sing_box_bin" ] || return 1
+	command -v nslookup >/dev/null 2>&1 || return 1
+	validate_dns_server_spec "$spec" || return 1
+	validate_socks_host "$socks_check_host" || return 1
+	validate_port "$socks_check_port" || return 1
+	validate_port "$check_port_value" || return 1
+
+	cat > "$check_config" <<EOF
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "bootstrap_dns",
+        "server": "$(realip_dns_addr)",
+        "server_port": 53,
+        "detour": "direct"
+      },
+EOF
+	emit_dns_server_object_json "$check_config" "check_dns" "$spec" "      " "check_socks"
+	cat >> "$check_config" <<EOF
+
+    ],
+    "final": "check_dns"
+  },
+  "inbounds": [
+    {
+      "type": "direct",
+      "tag": "dns_in",
+      "listen": "127.0.0.1",
+      "listen_port": $check_port_value,
+      "network": "udp"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "check_socks",
+      "server": "$socks_check_host",
+      "server_port": $socks_check_port,
+      "version": "5"
+    },
+    {
+      "type": "direct",
+      "tag": "direct",
+      "routing_mark": 255
+    }
+  ],
+  "route": {
+    "default_domain_resolver": "bootstrap_dns",
+    "rules": [
+      {
+        "action": "hijack-dns",
+        "inbound": "dns_in"
+      }
+    ],
+    "final": "direct"
+  }
+}
+EOF
+
+	"$sing_box_bin" check -c "$check_config" >/dev/null 2>&1 || {
+		rm -f "$check_config" "$check_output"
+		return 1
+	}
+	"$sing_box_bin" run -c "$check_config" >/dev/null 2>&1 &
+	check_pid="$!"
+	sleep 1
+	nslookup "$check_domain" "127.0.0.1:$check_port_value" >"$check_output" 2>&1 &
+	lookup_pid="$!"
+	( sleep "$check_timeout"; kill "$lookup_pid" 2>/dev/null || true; sleep 1; kill -9 "$lookup_pid" 2>/dev/null || true ) &
+	watchdog_pid="$!"
+	wait "$lookup_pid" 2>/dev/null || true
+	kill "$watchdog_pid" 2>/dev/null || true
+	kill "$check_pid" 2>/dev/null || true
+	wait "$check_pid" 2>/dev/null || true
+
+	if grep -q '^Name:' "$check_output" && grep -q '^Address:.*[0-9]' "$check_output"; then
+		rm -f "$check_config" "$check_output"
+		return 0
+	fi
+
+	rm -f "$check_config" "$check_output"
+	return 1
+}
+
+check_dns_server_direct() {
+	spec="$1"
+	check_port_value="$2"
+	check_domain="$(dns_check_domain)"
+	check_timeout="$(dns_check_timeout)"
+	sing_box_bin="$(cfg sing_box_bin /usr/bin/sing-box)"
+	check_config="/tmp/sockroute-dns-check-direct-$$-$check_port_value.json"
+	check_output="/tmp/sockroute-dns-check-direct-$$-$check_port_value.out"
+
+	[ -x "$sing_box_bin" ] || return 1
+	command -v nslookup >/dev/null 2>&1 || return 1
+	validate_dns_server_spec "$spec" || return 1
+	validate_port "$check_port_value" || return 1
+
+	cat > "$check_config" <<EOF
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "bootstrap_dns",
+        "server": "$(realip_dns_addr)",
+        "server_port": 53,
+        "detour": "direct"
+      },
+EOF
+	emit_dns_server_object_json "$check_config" "check_dns" "$spec" "      " "direct"
+	cat >> "$check_config" <<EOF
+
+    ],
+    "final": "check_dns"
+  },
+  "inbounds": [
+    {
+      "type": "direct",
+      "tag": "dns_in",
+      "listen": "127.0.0.1",
+      "listen_port": $check_port_value,
+      "network": "udp"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct",
+      "routing_mark": 255
+    }
+  ],
+  "route": {
+    "default_domain_resolver": "bootstrap_dns",
+    "rules": [
+      {
+        "action": "hijack-dns",
+        "inbound": "dns_in"
+      }
+    ],
+    "final": "direct"
+  }
+}
+EOF
+
+	"$sing_box_bin" check -c "$check_config" >/dev/null 2>&1 || {
+		rm -f "$check_config" "$check_output"
+		return 1
+	}
+	"$sing_box_bin" run -c "$check_config" >/dev/null 2>&1 &
+	check_pid="$!"
+	sleep 1
+	nslookup "$check_domain" "127.0.0.1:$check_port_value" >"$check_output" 2>&1 &
+	lookup_pid="$!"
+	( sleep "$check_timeout"; kill "$lookup_pid" 2>/dev/null || true; sleep 1; kill -9 "$lookup_pid" 2>/dev/null || true ) &
+	watchdog_pid="$!"
+	wait "$lookup_pid" 2>/dev/null || true
+	kill "$watchdog_pid" 2>/dev/null || true
+	kill "$check_pid" 2>/dev/null || true
+	wait "$check_pid" 2>/dev/null || true
+
+	if grep -q '^Name:' "$check_output" && grep -q '^Address:.*[0-9]' "$check_output"; then
+		rm -f "$check_config" "$check_output"
+		return 0
+	fi
+
+	rm -f "$check_config" "$check_output"
+	return 1
+}
+
 write_config() {
 	config_file="$(cfg sing_box_config /etc/sockroute/sing-box.json)"
 	log_file="$(cfg log_file /tmp/sockroute.log)"
-	port="$(listen_port)"
+	transparent_listen_port="$(transparent_port)"
+	dns_listen_port="$(dns_port)"
 	socks_host="$(socks_host)"
 	socks_port="$(socks_port)"
 	cidr="$(lan_cidr)"
 
-	validate_port "$port" || {
+	validate_port "$transparent_listen_port" || {
 		printf 'ERROR: bad listen port\n' >&2
+		exit 1
+	}
+	validate_port "$dns_listen_port" || {
+		printf 'ERROR: bad dns port\n' >&2
 		exit 1
 	}
 	validate_socks_host "$socks_host" || {
@@ -453,18 +1159,89 @@ write_config() {
     "timestamp": true,
     "output": "$log_file"
   },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "bootstrap_dns",
+        "server": "$(realip_dns_addr)",
+        "server_port": 53,
+        "detour": "direct"
+      },
+EOF
+	emit_dns_server_object_json "$config_file" "default_dns" "$(default_dns_server)" "      " "direct"
+
+	for section in $(client_sections); do
+		ip="$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)"
+		validate_ip4 "$ip" || continue
+		index=1
+		for dns_server in $(client_effective_dns_servers "$section"); do
+			validate_dns_server_spec "$dns_server" || continue
+			if dns_server_is_lan "$dns_server"; then
+				dns_detour="direct"
+			elif client_has_custom_socks "$section" "$socks_host" "$socks_port"; then
+				dns_detour="$(client_socks_tag "$ip")"
+			else
+				dns_detour="default_socks"
+			fi
+			emit_dns_server_json "$config_file" "$(dns_server_tag "$ip" "$index")" "$dns_server" "$dns_detour"
+			index=$((index + 1))
+		done
+	done
+
+	cat >> "$config_file" <<EOF
+    ],
+    "rules": [
+EOF
+
+	first_dns_rule=1
+	for section in $(client_sections); do
+		ip="$(uci -q get "$CONFIG.$section.ip" 2>/dev/null || true)"
+		validate_ip4 "$ip" || continue
+		client_has_effective_dns_servers "$section" || continue
+		dns_tag="$(dns_server_tag "$ip" 1)"
+		[ "$first_dns_rule" -eq 1 ] || printf '      ,\n' >> "$config_file"
+		first_dns_rule=0
+		cat >> "$config_file" <<EOF
+      {
+        "source_ip_cidr": [
+          "$ip/32"
+        ],
+        "server": "$dns_tag"
+      }
+EOF
+	done
+
+	cat >> "$config_file" <<EOF
+    ],
+    "final": "default_dns"
+  },
   "inbounds": [
+    {
+      "type": "direct",
+      "tag": "dns_in",
+      "listen": "::",
+      "listen_port": $dns_listen_port,
+      "network": "udp"
+    },
+    {
+      "type": "direct",
+      "tag": "dns_tcp_in",
+      "listen": "::",
+      "listen_port": $dns_listen_port,
+      "network": "tcp"
+    },
     {
       "type": "redirect",
       "tag": "redirect_tcp",
       "listen": "::",
-      "listen_port": $port
+      "listen_port": $transparent_listen_port
     },
     {
       "type": "tproxy",
       "tag": "tproxy_udp",
       "listen": "::",
-      "listen_port": $port,
+      "listen_port": $transparent_listen_port,
       "network": "udp"
     }
   ],
@@ -505,7 +1282,16 @@ EOF
 	cat >> "$config_file" <<EOF
   ],
   "route": {
+    "default_domain_resolver": "default_dns",
     "rules": [
+      {
+        "action": "hijack-dns",
+        "inbound": "dns_in"
+      },
+      {
+        "action": "hijack-dns",
+        "inbound": "dns_tcp_in"
+      },
       {
         "action": "sniff",
         "inbound": "redirect_tcp"
@@ -947,6 +1733,98 @@ test_socks_profile() {
 	test_socks_endpoint "$(socks_profile_host "$section")" "$(socks_profile_port "$section")" "$section"
 }
 
+list_dns_profiles() {
+	main_ref="$(cfg dns_ref "")"
+	for section in $(dns_profile_sections); do
+		label="$(dns_profile_label "$section")"
+		server_value="$(dns_profile_server "$section")"
+		check="$(uci -q get "$CONFIG.$section.last_check" 2>/dev/null || printf 'unknown')"
+		detail="$(uci -q get "$CONFIG.$section.last_check_detail" 2>/dev/null || printf 'не проверялся')"
+		[ "$section" = "$main_ref" ] && active="default" || active=""
+		validate_dns_server_spec "$server_value" || continue
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$label" "$server_value" "$check" "$(sanitize_detail "$detail")" "$active"
+	done
+}
+
+test_dns_profile() {
+	section="${1:-}"
+	status="fail"
+	detail=""
+	server="$(dns_profile_server "$section")"
+
+	validate_dns_server_spec "$server" || {
+		health_line dns fail "bad dns server"
+		return 1
+	}
+
+	if dns_server_is_lan "$server"; then
+		if check_dns_server_direct "$server" 18053 >/dev/null 2>&1; then
+			status="ok"
+			detail="DNS отвечает напрямую: $server"
+		else
+			status="fail"
+			detail="DNS не ответил напрямую: $server"
+		fi
+	else
+		if check_dns_server_through_socks "$server" "$(socks_host)" "$(socks_port)" 18053 >/dev/null 2>&1; then
+			status="ok"
+			detail="DNS отвечает через SOCKS: $server"
+		else
+			status="fail"
+			detail="DNS не ответил через SOCKS: $server"
+		fi
+	fi
+
+	detail="$(sanitize_detail "$detail")"
+	if dns_profile_exists "$section"; then
+		uci set "$CONFIG.$section.last_check=$status"
+		uci set "$CONFIG.$section.last_check_detail=$detail"
+		uci set "$CONFIG.$section.last_check_time=$(date +%Y-%m-%d_%H:%M:%S 2>/dev/null || true)"
+		uci commit "$CONFIG"
+	fi
+	health_line dns "$status" "$detail"
+	[ "$status" = "fail" ] && return 1
+	return 0
+}
+
+delete_dns_profile() {
+	section="${1:-}"
+	dns_profile_exists "$section" || return 0
+	server="$(dns_profile_server "$section")"
+
+	if [ "$(cfg dns_ref "")" = "$section" ]; then
+		uci set "$CONFIG.$SECTION.default_dns_server=$server"
+		uci -q delete "$CONFIG.$SECTION.dns_ref" 2>/dev/null || true
+	fi
+
+	for client_section in $(client_sections); do
+		if [ "$(client_dns_ref "$client_section")" = "$section" ]; then
+			uci -q delete "$CONFIG.$client_section.dns_ref" 2>/dev/null || true
+		fi
+	done
+
+	uci -q delete "$CONFIG.$section" 2>/dev/null || true
+	uci commit "$CONFIG"
+	write_config
+}
+
+set_dns_ref() {
+	section="${1:-}"
+	dns_profile_exists "$section" || {
+		printf 'ERROR: bad dns profile\n' >&2
+		exit 1
+	}
+	server="$(dns_profile_server "$section")"
+	validate_dns_server_spec "$server" || {
+		printf 'ERROR: bad dns server\n' >&2
+		exit 1
+	}
+	uci set "$CONFIG.$SECTION.dns_ref=$section"
+	uci set "$CONFIG.$SECTION.default_dns_server=$server"
+	uci commit "$CONFIG"
+	write_config
+}
+
 health_line() {
 	printf '%s\t%s\t%s\n' "$1" "$2" "$3"
 }
@@ -973,7 +1851,7 @@ list_health() {
 	mangle="$(mangle_chain)"
 	nat_hook="$(nat_hook_chain)"
 	mangle_hook="$(mangle_hook_chain)"
-	port="$(listen_port)"
+	port="$(transparent_port)"
 	socks="$(socks_host):$(socks_port)"
 	config_file="$(cfg sing_box_config /etc/sockroute/sing-box.json)"
 	sing_box_bin="$(cfg sing_box_bin /usr/bin/sing-box)"
@@ -1003,7 +1881,7 @@ list_health() {
 	fi
 
 	if nft list set "$fam" "$tbl" "$set" >/dev/null 2>&1; then
-		count="$(nft list set "$fam" "$tbl" "$set" 2>/dev/null | sed -n 's/.*elements = { \(.*\) }.*/\1/p' | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+		count="$(nft list set "$fam" "$tbl" "$set" 2>/dev/null | sed -n '/elements = {/,/}/p' | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | wc -l | tr -d ' ')"
 		health_line nft-set ok "set $set, elements: ${count:-0}"
 	else
 		health_line nft-set fail "set $set не найден"
@@ -1019,6 +1897,18 @@ list_health() {
 		health_line udp-chain ok "$mangle найден"
 	else
 		health_line udp-chain fail "$mangle не найден"
+	fi
+
+	if realip_dns_enabled; then
+		if sockroute_dns_hijack_ready; then
+			health_line realip-dns ok "DNS клиентов SockRoute перенаправлен в локальный DNS обработчик"
+		elif nft list chain "$fam" "$tbl" "$(dns_chain)" 2>/dev/null | grep -q "$SOCKROUTE_DNS_UDP_COMMENT"; then
+			health_line realip-dns ok "DNS клиентов SockRoute перенаправлен в локальный DNS обработчик"
+		else
+			health_line realip-dns warn "DNS hijack rule не найден"
+		fi
+	else
+		health_line realip-dns warn "realip_dns выключен"
 	fi
 
 	if nft list chain "$fam" "$tbl" "$nat_hook" 2>/dev/null | grep -q "$NAT_HOOK_COMMENT"; then
@@ -1097,6 +1987,13 @@ check_client() {
 		else
 			health_line outbound ok "default SOCKS $(socks_host):$(socks_port)"
 		fi
+		dns_ref="$(client_dns_ref "$section")"
+		dns_servers="$(client_effective_dns_servers "$section" | tr '\n' ' ' | sed 's/ $//')"
+		if [ -n "$dns_servers" ]; then
+			[ -n "$dns_ref" ] && health_line dns ok "$dns_ref: $dns_servers" || health_line dns ok "$dns_servers"
+		else
+			health_line dns ok "default DNS $(default_dns_server)"
+		fi
 	else
 		health_line profile warn "профиль клиента не найден"
 		health_line outbound ok "default SOCKS $(socks_host):$(socks_port)"
@@ -1126,6 +2023,16 @@ check_client() {
 		health_line hooks ok "TCP/UDP hook-правила установлены"
 	else
 		health_line hooks fail "TCP/UDP hook-правила не полностью установлены"
+	fi
+
+	if realip_dns_enabled && sockroute_dns_hijack_ready; then
+		health_line realip-dns ok "DNS клиента перенаправлен в локальный DNS обработчик"
+	elif realip_dns_enabled && nft list chain "$(family)" "$(table)" "$(dns_chain)" 2>/dev/null | grep -q "$SOCKROUTE_DNS_UDP_COMMENT"; then
+		health_line realip-dns ok "DNS клиента перенаправлен в локальный DNS обработчик"
+	elif realip_dns_enabled; then
+		health_line realip-dns warn "DNS redirect rule не найден"
+	else
+		health_line realip-dns warn "realip_dns выключен"
 	fi
 }
 
@@ -1328,8 +2235,10 @@ list_status() {
 		profile_socks_ref="$(client_socks_ref "$section")"
 		profile_socks_host="$(client_socks_host "$section")"
 		profile_socks_port="$(client_socks_port "$section")"
+		profile_dns_servers="$(client_dns_servers "$section" | tr '\n' ' ' | sed 's/ $//')"
+		profile_dns_ref="$(client_dns_ref "$section")"
 		validate_ip4 "$ip" || continue
-		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$ip" "$label" "$profile_socks_ref" "$profile_socks_host" "$profile_socks_port"
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$ip" "$label" "$profile_socks_ref" "$profile_socks_host" "$profile_socks_port" "$profile_dns_servers" "$profile_dns_ref"
 	done
 
 	printf '\nhidden_clients:\n'
@@ -1359,6 +2268,7 @@ case "${1:-}" in
 	list|show) with_lock list_status ;;
 	socks-list|list-socks|socks) list_socks_candidates ;;
 	socks-profiles|list-socks-profiles) list_socks_profiles ;;
+	dns-profiles|list-dns-profiles) list_dns_profiles ;;
 	set-socks-profile|set_socks_profile) with_lock set_socks_profile "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
 	delete-socks-profile|delete_socks_profile) with_lock delete_socks_profile "${2:-}" ;;
 	test-socks-profile|test_socks_profile) with_lock test_socks_profile "${2:-}" ;;
@@ -1369,11 +2279,19 @@ case "${1:-}" in
 	check-client|client-check) check_client "${2:-}" ;;
 	set-socks|set_socks) with_lock set_socks "${2:-}" "${3:-}" ;;
 	set-socks-ref|set_socks_ref) with_lock set_socks_ref "${2:-}" ;;
+	set-default-dns|set_default_dns) with_lock set_default_dns "${2:-}" ;;
+	set-dns-profile|set_dns_profile) with_lock set_dns_profile "${2:-}" "${3:-}" "${4:-}" ;;
+	delete-dns-profile|delete_dns_profile) with_lock delete_dns_profile "${2:-}" ;;
+	test-dns-profile|test_dns_profile) with_lock test_dns_profile "${2:-}" ;;
+	set-dns-ref|set_dns_ref) with_lock set_dns_ref "${2:-}" ;;
 	set-client-socks|set_client_socks) with_lock set_client_socks "${2:-}" "${3:-}" "${4:-}" ;;
 	set-client-socks-ref|set_client_socks_ref) with_lock set_client_socks_ref "${2:-}" "${3:-}" ;;
 	clear-client-socks|clear_client_socks) with_lock clear_client_socks "${2:-}" ;;
+	set-client-dns-ref|set_client_dns_ref) with_lock set_client_dns_ref "${2:-}" "${3:-}" ;;
+	set-client-dns|set_client_dns) shift; client_ip="${1:-}"; shift || true; with_lock set_client_dns "$client_ip" "$@" ;;
+	clear-client-dns|clear_client_dns) with_lock clear_client_dns "${2:-}" ;;
 	*)
-		printf 'Usage: %s setup|teardown|ready|write-config|socks-list|socks-profiles|set-socks-profile SECTION LABEL HOST PORT|set-socks-ref SECTION|set-socks HOST PORT|test-socks HOST PORT|test-socks-ident HOST PORT|set-client-socks IP HOST PORT|set-client-socks-ref IP SECTION|clear-client-socks IP|health|dhcp-list|check-client IP|add IP|add-named IP LABEL|del IP|delete-client IP|rename IP LABEL|has IP|list\n' "$0" >&2
+		printf 'Usage: %s setup|teardown|ready|write-config|socks-list|socks-profiles|dns-profiles|set-socks-profile SECTION LABEL HOST PORT|set-socks-ref SECTION|set-socks HOST PORT|set-default-dns DNS|set-dns-profile SECTION LABEL DNS|set-dns-ref SECTION|test-dns-profile SECTION|test-socks HOST PORT|test-socks-ident HOST PORT|set-client-socks IP HOST PORT|set-client-socks-ref IP SECTION|clear-client-socks IP|set-client-dns-ref IP SECTION|default|set-client-dns IP DNS...|clear-client-dns IP|health|dhcp-list|check-client IP|add IP|add-named IP LABEL|del IP|delete-client IP|rename IP LABEL|has IP|list\n' "$0" >&2
 		exit 2
 		;;
 esac

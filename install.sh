@@ -144,6 +144,19 @@ ensure_config() {
 	lan_cidr="$(detect_lan_cidr || true)"
 	[ -n "$lan_cidr" ] || lan_cidr="$(uci -q get sockroute.main.lan_cidr 2>/dev/null || printf '192.168.1.0/24')"
 	uci set "sockroute.main.lan_cidr=$lan_cidr"
+	uci -q get sockroute.main.realip_dns >/dev/null 2>&1 || uci set sockroute.main.realip_dns='1'
+	uci -q get sockroute.main.realip_dns_addr >/dev/null 2>&1 || uci set sockroute.main.realip_dns_addr='1.1.1.1'
+	uci -q get sockroute.main.default_dns_server >/dev/null 2>&1 || uci set sockroute.main.default_dns_server="udp://$(uci -q get sockroute.main.realip_dns_addr 2>/dev/null || printf '1.1.1.1')"
+	uci -q get sockroute.main.auto_apply >/dev/null 2>&1 || uci set sockroute.main.auto_apply='0'
+	uci -q get sockroute.main.check_loop >/dev/null 2>&1 || uci set sockroute.main.check_loop='0'
+	uci -q get sockroute.main.socks_check_interval >/dev/null 2>&1 || uci set sockroute.main.socks_check_interval='30'
+	uci -q get sockroute.main.dns_check_interval >/dev/null 2>&1 || uci set sockroute.main.dns_check_interval='30'
+	uci -q get sockroute.main.dns_standard_label >/dev/null 2>&1 || uci set sockroute.main.dns_standard_label='DNS standard'
+	uci -q get sockroute.main.dns_standard_server >/dev/null 2>&1 || uci set sockroute.main.dns_standard_server='udp://100.100.0.217'
+	uci -q get sockroute.main.dns_unblock_label >/dev/null 2>&1 || uci set sockroute.main.dns_unblock_label='DNS unblock'
+	uci -q get sockroute.main.dns_unblock_server >/dev/null 2>&1 || uci set sockroute.main.dns_unblock_server='udp://100.100.0.156'
+	uci -q get sockroute.main.dns_port >/dev/null 2>&1 || uci set sockroute.main.dns_port='1053'
+	uci -q get sockroute.main.transparent_port >/dev/null 2>&1 || uci set sockroute.main.transparent_port="$(uci -q get sockroute.main.listen_port 2>/dev/null || printf '1042')"
 	uci -q get sockroute.main.listen_port >/dev/null 2>&1 || uci set sockroute.main.listen_port='1042'
 	uci -q get sockroute.main.socks_host >/dev/null 2>&1 || uci set sockroute.main.socks_host='127.0.0.1'
 	uci -q get sockroute.main.socks_port >/dev/null 2>&1 || uci set sockroute.main.socks_port='1080'
@@ -174,11 +187,28 @@ ensure_config() {
 		uci set "sockroute.main.socks_ref=$section"
 		uci commit sockroute
 	fi
+
+	if ! uci show sockroute 2>/dev/null | grep -q '=dns'; then
+		uci set sockroute.dns_standard='dns'
+		uci set sockroute.dns_standard.label="$(uci -q get sockroute.main.dns_standard_label 2>/dev/null || printf 'DNS standard')"
+		uci set sockroute.dns_standard.server="$(uci -q get sockroute.main.dns_standard_server 2>/dev/null || printf 'udp://100.100.0.217')"
+		uci set sockroute.dns_unblock='dns'
+		uci set sockroute.dns_unblock.label="$(uci -q get sockroute.main.dns_unblock_label 2>/dev/null || printf 'DNS unblock')"
+		uci set sockroute.dns_unblock.server="$(uci -q get sockroute.main.dns_unblock_server 2>/dev/null || printf 'udp://100.100.0.156')"
+		uci -q get sockroute.main.dns_ref >/dev/null 2>&1 || uci set sockroute.main.dns_ref='dns_standard'
+		uci commit sockroute
+	fi
 }
 
 reload_luci() {
-	rm -f /tmp/luci-indexcache* /tmp/luci-requirecache* 2>/dev/null || true
-	rm -rf /tmp/luci-modulecache/* 2>/dev/null || true
+	# LuCI app views are loaded as JS modules with ?v=<package-db-mtime>.
+	# When files are installed manually, package managers do not update this
+	# mtime, so browsers can keep an old /view/sockroute.js even after cache
+	# files and uhttpd are restarted.
+	[ -e /lib/apk/db/installed ] && touch /lib/apk/db/installed 2>/dev/null || true
+	[ -e /usr/lib/opkg/status ] && touch /usr/lib/opkg/status 2>/dev/null || true
+	rm -f /tmp/luci-indexcache* /tmp/luci-requirecache* /tmp/luci-modulecache* 2>/dev/null || true
+	rm -rf /tmp/luci-* /tmp/lib/luci-* /tmp/luci-sessions 2>/dev/null || true
 	[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart 2>/dev/null || true
 	[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd restart 2>/dev/null || true
 }
@@ -207,4 +237,3 @@ main() {
 }
 
 main "$@"
-

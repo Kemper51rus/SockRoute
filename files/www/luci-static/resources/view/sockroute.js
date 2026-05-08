@@ -890,9 +890,26 @@ function healthRowByName(rows, name) {
 	return { name: name, status: 'warn', detail: 'нет данных' };
 }
 
-function mergedHealthCard(rows, names) {
+function compactRuntimeDetail(rows, expectedCount) {
+	var portDetail = healthRowByName(rows, 'transparent-port').detail || '';
+	var setDetail = healthRowByName(rows, 'nft-set').detail || '';
+	var portMatch = portDetail.match(/порт\s+([0-9]+)/);
+	var countMatch = setDetail.match(/elements:\s*([0-9]+)/);
+	var actualCount = countMatch ? countMatch[1] : '';
+	var parts = [];
+
+	if (portMatch)
+		parts.push('порт %s'.format(portMatch[1]));
+	if (actualCount)
+		parts.push(expectedCount != null ? 'IP %s/%s'.format(actualCount, expectedCount) : '%s IP в set'.format(actualCount));
+
+	return parts.length ? parts.join(' / ') : '';
+}
+
+function mergedHealthCard(rows, names, expectedCount) {
 	var detail = [];
 	var status = 'ok';
+	var compactRuntime = names.length === 2 && names[0] === 'transparent-port' && names[1] === 'nft-set';
 
 	for (var i = 0; i < names.length; i++) {
 		var row = healthRowByName(rows, names[i]);
@@ -904,7 +921,7 @@ function mergedHealthCard(rows, names) {
 			status = 'warn';
 	}
 
-	return { status: status, detail: detail.join(' / ') };
+	return { status: status, detail: compactRuntime ? compactRuntimeDetail(rows, expectedCount) || detail.join(' / ') : detail.join(' / ') };
 }
 
 function aggregateProfilesStatus(profiles, label) {
@@ -941,15 +958,14 @@ function updateStatusCard(key, status, detail) {
 	setNodeText('sockroute-status-%s-detail'.format(key), detail || '-', detail || '-');
 }
 
-function refreshStatusCardsInBackground() {
+function refreshStatusCardsInBackground(expectedClients) {
 	return L.resolveDefault(fs.exec(helperPath, [ 'health' ]), { code: 1, stdout: '', stderr: '' }).then(function(res) {
 		var rows = parseHealth(res.stdout || '');
-		var runtime = mergedHealthCard(rows, [ 'transparent-port', 'nft-set' ]);
+		var runtime = mergedHealthCard(rows, [ 'transparent-port', 'nft-set' ], expectedClients);
 
 		if (!rows.length)
 			return;
 
-		updateStatusCard('service', healthRowByName(rows, 'service').status, healthRowByName(rows, 'service').detail);
 		updateStatusCard('socks', healthRowByName(rows, 'socks-outbound').status, healthRowByName(rows, 'socks-outbound').detail);
 		updateStatusCard('runtime', runtime.status, runtime.detail);
 		updateStatusCard('api', healthRowByName(rows, 'api').status, healthRowByName(rows, 'api').detail);
@@ -970,7 +986,8 @@ function refreshSocksProfileIdent(profile) {
 		var rows = parseHealth(res.stdout || '');
 		var row = healthRowByName(rows, 'ident');
 		var detail = row.detail || res.stderr || 'нет вывода';
-		var status = row.status === 'ok' ? 'ok' : 'fail';
+		var identIp = identIpFromDetail(detail);
+		var status = row.status === 'ok' && identIp ? 'ok' : 'fail';
 
 		if (!rows.length)
 			detail = res.stderr || 'нет вывода';
@@ -978,19 +995,22 @@ function refreshSocksProfileIdent(profile) {
 		setStatusBadge('sockroute-socks-status-%s'.format(key), status);
 		setNodeText(
 			'sockroute-socks-ident-%s'.format(key),
-			status === 'ok' ? identIpFromDetail(detail) : 'FAIL',
+			status === 'ok' ? identIp : 'FAIL',
 			'%s / обновлено %s'.format(detail, currentClock())
 		);
 		return status;
 	});
 }
 
-function refreshSocksProfilesInBackground(profiles) {
-	var sequence = Promise.resolve();
+function refreshSocksProfilesInBackground(profiles, retryFailed) {
+	var failedProfiles = [];
+	var checks = [];
 
 	if (!document.getElementById('sockroute-root')) {
 		if (window.sockrouteSocksRefreshTimer)
 			window.clearInterval(window.sockrouteSocksRefreshTimer);
+		if (window.sockrouteSocksRetryTimer)
+			window.clearTimeout(window.sockrouteSocksRetryTimer);
 		return Promise.resolve();
 	}
 
@@ -1000,17 +1020,25 @@ function refreshSocksProfilesInBackground(profiles) {
 	window.sockrouteSocksRefreshBusy = true;
 
 	(profiles || []).forEach(function(profile) {
-		sequence = sequence.then(function() {
-			return refreshSocksProfileIdent(profile).then(function(status) {
-				profile.lastCheck = status;
-			});
-		});
+		checks.push(refreshSocksProfileIdent(profile).then(function(status) {
+			profile.lastCheck = status;
+			if (status !== 'ok')
+				failedProfiles.push(profile);
+			return status;
+		}));
 	});
 
-	return sequence.then(function() {
+	return Promise.all(checks).then(function() {
 		var aggregate = aggregateProfilesStatus(profiles || [], 'SOCKS');
 		updateStatusCard('socks', aggregate.status, aggregate.detail);
 		window.sockrouteSocksRefreshBusy = false;
+		if (retryFailed && failedProfiles.length && document.getElementById('sockroute-root')) {
+			if (window.sockrouteSocksRetryTimer)
+				window.clearTimeout(window.sockrouteSocksRetryTimer);
+			window.sockrouteSocksRetryTimer = window.setTimeout(function() {
+				refreshSocksProfilesInBackground(failedProfiles, true);
+			}, 0);
+		}
 	}, function(err) {
 		window.sockrouteSocksRefreshBusy = false;
 		throw err;
@@ -1042,12 +1070,15 @@ function refreshDnsProfileInBackground(profile) {
 	});
 }
 
-function refreshDnsProfilesInBackground(profiles) {
-	var sequence = Promise.resolve();
+function refreshDnsProfilesInBackground(profiles, retryFailed) {
+	var failedProfiles = [];
+	var checks = [];
 
 	if (!document.getElementById('sockroute-root')) {
 		if (window.sockrouteDnsRefreshTimer)
 			window.clearInterval(window.sockrouteDnsRefreshTimer);
+		if (window.sockrouteDnsRetryTimer)
+			window.clearTimeout(window.sockrouteDnsRetryTimer);
 		return Promise.resolve();
 	}
 
@@ -1057,17 +1088,25 @@ function refreshDnsProfilesInBackground(profiles) {
 	window.sockrouteDnsRefreshBusy = true;
 
 	(profiles || []).forEach(function(profile) {
-		sequence = sequence.then(function() {
-			return refreshDnsProfileInBackground(profile).then(function(status) {
-				profile.lastCheck = status;
-			});
-		});
+		checks.push(refreshDnsProfileInBackground(profile).then(function(status) {
+			profile.lastCheck = status;
+			if (status !== 'ok')
+				failedProfiles.push(profile);
+			return status;
+		}));
 	});
 
-	return sequence.then(function() {
+	return Promise.all(checks).then(function() {
 		var aggregate = aggregateProfilesStatus(profiles || [], 'DNS');
 		updateStatusCard('dns', aggregate.status, aggregate.detail);
 		window.sockrouteDnsRefreshBusy = false;
+		if (retryFailed && failedProfiles.length && document.getElementById('sockroute-root')) {
+			if (window.sockrouteDnsRetryTimer)
+				window.clearTimeout(window.sockrouteDnsRetryTimer);
+			window.sockrouteDnsRetryTimer = window.setTimeout(function() {
+				refreshDnsProfilesInBackground(failedProfiles, true);
+			}, 0);
+		}
 	}, function(err) {
 		window.sockrouteDnsRefreshBusy = false;
 		throw err;
@@ -1175,7 +1214,7 @@ function refreshClientTrafficInBackground(clients) {
 	});
 }
 
-function scheduleBackgroundChecks(profiles, dnsProfiles, clients, socksInterval, dnsInterval, checkLoop) {
+function scheduleBackgroundChecks(profiles, dnsProfiles, clients, socksInterval, dnsInterval, checkLoop, activeCount) {
 	var snapshot = (profiles || []).map(function(profile) {
 		return {
 			section: profile.section,
@@ -1203,16 +1242,22 @@ function scheduleBackgroundChecks(profiles, dnsProfiles, clients, socksInterval,
 		window.clearInterval(window.sockrouteTrafficRefreshTimer);
 	if (window.sockrouteSocksRefreshDelay)
 		window.clearTimeout(window.sockrouteSocksRefreshDelay);
+	if (window.sockrouteSocksRetryTimer)
+		window.clearTimeout(window.sockrouteSocksRetryTimer);
 	if (window.sockrouteDnsRefreshTimer)
 		window.clearInterval(window.sockrouteDnsRefreshTimer);
 	if (window.sockrouteDnsRefreshDelay)
 		window.clearTimeout(window.sockrouteDnsRefreshDelay);
+	if (window.sockrouteDnsRetryTimer)
+		window.clearTimeout(window.sockrouteDnsRetryTimer);
 	if (window.sockrouteTrafficRefreshDelay)
 		window.clearTimeout(window.sockrouteTrafficRefreshDelay);
 	if (window.sockrouteHealthRefreshDelay)
 		window.clearTimeout(window.sockrouteHealthRefreshDelay);
 
-	window.sockrouteHealthRefreshDelay = window.setTimeout(refreshStatusCardsInBackground, 800);
+	window.sockrouteHealthRefreshDelay = window.setTimeout(function() {
+		refreshStatusCardsInBackground(activeCount);
+	}, 800);
 	if (clientSnapshot.length) {
 		window.sockrouteTrafficRefreshDelay = window.setTimeout(function() {
 			refreshClientTrafficInBackground(clientSnapshot);
@@ -1224,22 +1269,22 @@ function scheduleBackgroundChecks(profiles, dnsProfiles, clients, socksInterval,
 
 	if (snapshot.length) {
 		window.sockrouteSocksRefreshDelay = window.setTimeout(function() {
-			refreshSocksProfilesInBackground(snapshot);
+			refreshSocksProfilesInBackground(snapshot, !checkLoop);
 		}, 1200);
 		if (checkLoop) {
 			window.sockrouteSocksRefreshTimer = window.setInterval(function() {
-				refreshSocksProfilesInBackground(snapshot);
+				refreshSocksProfilesInBackground(snapshot, false);
 			}, socksIntervalMs);
 		}
 	}
 
 	if (dnsSnapshot.length) {
 		window.sockrouteDnsRefreshDelay = window.setTimeout(function() {
-			refreshDnsProfilesInBackground(dnsSnapshot);
+			refreshDnsProfilesInBackground(dnsSnapshot, !checkLoop);
 		}, 1600);
 		if (checkLoop) {
 			window.sockrouteDnsRefreshTimer = window.setInterval(function() {
-				refreshDnsProfilesInBackground(dnsSnapshot);
+				refreshDnsProfilesInBackground(dnsSnapshot, false);
 			}, dnsIntervalMs);
 		}
 	}
@@ -1811,8 +1856,10 @@ return view.extend({
 		var counter = document.getElementById('sockroute-pending-client-count');
 		var button = document.getElementById('sockroute-save-pending-clients');
 
-		if (counter)
+		if (counter) {
 			counter.textContent = count ? 'Ожидают сохранения: %d'.format(count) : '';
+			counter.style.display = count ? 'inline' : 'none';
+		}
 		if (button)
 			button.disabled = count ? null : 'disabled';
 	},
@@ -3027,11 +3074,9 @@ return view.extend({
 		if (mainSocksProfile && mainSocksProfile.lastCheckDetail)
 			socksDetail += ' / ' + mainSocksProfile.lastCheckDetail;
 		statusCards = [
-			{ key: 'service', label: 'Сервис', status: running ? 'ok' : 'warn', detail: running ? 'sockroute запущен' : 'sockroute остановлен' },
 			{ key: 'socks', label: 'SOCKS', status: socksAggregate.status, detail: socksAggregate.detail },
 			{ key: 'dns', label: 'DNS', status: dnsAggregate.status, detail: dnsAggregate.detail },
-			{ key: 'runtime', label: 'Runtime', status: running ? 'ok' : 'warn', detail: 'порт ' + listenPort + ' / set ' + nftSet },
-			{ key: 'clients', label: 'Клиенты ON', status: activeClients.length ? 'ok' : 'unknown', detail: String(activeClients.length) },
+			{ key: 'runtime', label: 'Runtime', status: running ? 'ok' : 'warn', detail: 'порт ' + listenPort + ' / IP ?/%s'.format(activeClients.length) },
 			{ key: 'api', label: 'API', status: allowedSources.length ? 'ok' : 'warn', detail: allowedSources.length ? allowedSources.join(', ') + (apiToken ? ' / token' : '') : 'нет разрешённых IP' }
 		];
 		var clientTable = [
@@ -3245,7 +3290,7 @@ return view.extend({
 		}));
 
 		if (typeof(window) !== 'undefined') {
-			scheduleBackgroundChecks(socksProfiles, dnsProfiles, clients, socksCheckInterval, dnsCheckInterval, checkLoop);
+			scheduleBackgroundChecks(socksProfiles, dnsProfiles, clients, socksCheckInterval, dnsCheckInterval, checkLoop, activeClients.length);
 			scheduleDeferredDataLoad(this);
 		}
 
@@ -3286,10 +3331,10 @@ return view.extend({
 						})
 					}, [ 'Настройки' ]),
 					!autoApply ? ' ' : '',
-					!autoApply ? E('span', {
+					!autoApply && pendingClientCount ? E('span', {
 						'id': 'sockroute-pending-client-count',
 						'style': 'margin-right:8px;'
-					}, [ pendingClientCount ? 'Ожидают сохранения: %d'.format(pendingClientCount) : '' ]) : '',
+					}, [ 'Ожидают сохранения: %d'.format(pendingClientCount) ]) : '',
 					!autoApply ? E('button', {
 						'id': 'sockroute-save-pending-clients',
 						'class': 'btn cbi-button-save important',

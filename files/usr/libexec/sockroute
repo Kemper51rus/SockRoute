@@ -124,6 +124,10 @@ mangle_chain() { cfg nft_mangle_chain SOCKROUTE_MANGLE; }
 nat_hook_chain() { cfg nft_nat_hook_chain dstnat; }
 mangle_hook_chain() { cfg nft_mangle_hook_chain mangle_prerouting; }
 dns_chain() { cfg nft_dns_chain PSW2_DNS; }
+dns_hijack_family() { cfg dns_hijack_family inet; }
+dns_hijack_table() { cfg dns_hijack_table fw4; }
+dns_hijack_set() { cfg dns_hijack_set sockroute_dns_clients; }
+dns_hijack_chain() { cfg dns_hijack_chain dstnat; }
 realip_dns_enabled() {
 	case "$(cfg realip_dns 1)" in
 		0|no|false|off) return 1 ;;
@@ -209,32 +213,107 @@ add_sockroute_dns_hijack_rules() {
 	fam="$1"
 	tbl="$2"
 	set="$3"
-	nat="$4"
-	mangle="$5"
-	lan="$6"
+	mangle="$4"
+	lan="$5"
 
 	realip_dns_enabled || return 0
-	port="$(dns_port)"
-	validate_port "$port" || port=1053
 
 	nft add rule "$fam" "$tbl" "$mangle" \
 		iifname "$lan" ip saddr "@$set" ip protocol udp udp dport 53 \
 		counter return comment "$SOCKROUTE_DNS_HIJACK_COMMENT"
-	nft add rule "$fam" "$tbl" "$nat" \
-		iifname "$lan" ip saddr "@$set" ip protocol udp udp dport 53 \
+}
+
+create_dns_hijack_set() {
+	dh_fam="$1"
+	dh_tbl="$2"
+	dh_set="$3"
+
+	nft add set "$dh_fam" "$dh_tbl" "$dh_set" "{ type ipv4_addr; flags interval; comment \"SockRoute DNS clients\"; }"
+}
+
+ensure_dns_hijack_set() {
+	dh_fam="$1"
+	dh_tbl="$2"
+	dh_set="$3"
+
+	if ! nft list set "$dh_fam" "$dh_tbl" "$dh_set" >/dev/null 2>&1; then
+		create_dns_hijack_set "$dh_fam" "$dh_tbl" "$dh_set"
+	fi
+}
+
+add_dns_hijack_element() {
+	client_ip="$1"
+	realip_dns_enabled || return 0
+	dns_fam="$(dns_hijack_family)"
+	dns_tbl="$(dns_hijack_table)"
+	dns_set="$(dns_hijack_set)"
+
+	ensure_dns_hijack_set "$dns_fam" "$dns_tbl" "$dns_set" || return 0
+	nft add element "$dns_fam" "$dns_tbl" "$dns_set" "{ $client_ip }" 2>/dev/null || true
+}
+
+del_dns_hijack_element() {
+	client_ip="$1"
+	dns_fam="$(dns_hijack_family)"
+	dns_tbl="$(dns_hijack_table)"
+	dns_set="$(dns_hijack_set)"
+
+	nft delete element "$dns_fam" "$dns_tbl" "$dns_set" "{ $client_ip }" 2>/dev/null || true
+}
+
+add_dns_hijack_redirect_rules() {
+	lan="$1"
+	realip_dns_enabled || return 0
+	dns_fam="$(dns_hijack_family)"
+	dns_tbl="$(dns_hijack_table)"
+	dns_set="$(dns_hijack_set)"
+	dns_chain_name="$(dns_hijack_chain)"
+	port="$(dns_port)"
+	validate_port "$port" || port=1053
+
+	nft list chain "$dns_fam" "$dns_tbl" "$dns_chain_name" >/dev/null
+	ensure_dns_hijack_set "$dns_fam" "$dns_tbl" "$dns_set"
+	delete_nft_rules "$dns_fam" "$dns_tbl" "$dns_chain_name" "$SOCKROUTE_DNS_HIJACK_COMMENT"
+
+	nft insert rule "$dns_fam" "$dns_tbl" "$dns_chain_name" position 0 \
+		iifname "$lan" ip saddr "@$dns_set" ip protocol tcp tcp dport 53 \
 		counter redirect to ":$port" comment "$SOCKROUTE_DNS_HIJACK_COMMENT"
-	nft add rule "$fam" "$tbl" "$nat" \
-		iifname "$lan" ip saddr "@$set" ip protocol tcp tcp dport 53 \
+	nft insert rule "$dns_fam" "$dns_tbl" "$dns_chain_name" position 0 \
+		iifname "$lan" ip saddr "@$dns_set" ip protocol udp udp dport 53 \
 		counter redirect to ":$port" comment "$SOCKROUTE_DNS_HIJACK_COMMENT"
+}
+
+delete_fw4_dns_hijack_rules() {
+	dns_fam="$(dns_hijack_family)"
+	dns_tbl="$(dns_hijack_table)"
+	dns_chain_name="$(dns_hijack_chain)"
+
+	delete_nft_rules "$dns_fam" "$dns_tbl" "$dns_chain_name" "$SOCKROUTE_DNS_HIJACK_COMMENT"
+}
+
+cleanup_dns_hijack_redirect_rules() {
+	delete_nft_rules inet fw4 dstnat "$SOCKROUTE_DNS_HIJACK_COMMENT"
+	delete_nft_rules inet passwall2 dstnat "$SOCKROUTE_DNS_HIJACK_COMMENT"
+	delete_fw4_dns_hijack_rules
+}
+
+delete_dns_hijack_set() {
+	dns_fam="$(dns_hijack_family)"
+	dns_tbl="$(dns_hijack_table)"
+	dns_set="$(dns_hijack_set)"
+
+	nft delete set "$dns_fam" "$dns_tbl" "$dns_set" 2>/dev/null || true
 }
 
 sockroute_dns_hijack_ready() {
 	fam="$(family)"
 	tbl="$(table)"
-	nat="$(nat_chain)"
 	mangle="$(mangle_chain)"
+	dns_fam="$(dns_hijack_family)"
+	dns_tbl="$(dns_hijack_table)"
+	dns_chain_name="$(dns_hijack_chain)"
 
-	nft list chain "$fam" "$tbl" "$nat" 2>/dev/null | grep -q "$SOCKROUTE_DNS_HIJACK_COMMENT" || return 1
+	nft list chain "$dns_fam" "$dns_tbl" "$dns_chain_name" 2>/dev/null | grep -q "$SOCKROUTE_DNS_HIJACK_COMMENT" || return 1
 	nft list chain "$fam" "$tbl" "$mangle" 2>/dev/null | grep -q "$SOCKROUTE_DNS_HIJACK_COMMENT" || return 1
 	return 0
 }
@@ -514,38 +593,17 @@ set_client_dns() {
 	client_ip="$1"
 	shift || true
 	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
-	section="$(client_section_by_ip "$client_ip" || true)"
-	[ -n "$section" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
+	client_section_name="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$client_section_name" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
 
-	check_host="$(client_socks_host "$section")"
-	check_port="$(client_socks_port "$section")"
-	if ! validate_socks_host "$check_host" || ! validate_port "$check_port"; then
-		check_host="$(socks_host)"
-		check_port="$(socks_port)"
-	fi
-
-	index=1
 	for dns_server in "$@"; do
 		validate_dns_server_spec "$dns_server" || { printf 'ERROR: bad dns server: %s\n' "$dns_server" >&2; exit 1; }
-		check_port_value=$((18053 + (index % 1000)))
-		if dns_server_is_lan "$dns_server"; then
-			check_dns_server_direct "$dns_server" "$check_port_value" || {
-				printf 'ERROR: dns check failed direct: %s\n' "$dns_server" >&2
-				exit 1
-			}
-		else
-			check_dns_server_through_socks "$dns_server" "$check_host" "$check_port" "$check_port_value" || {
-				printf 'ERROR: dns check failed via %s:%s: %s\n' "$check_host" "$check_port" "$dns_server" >&2
-				exit 1
-			}
-		fi
-		index=$((index + 1))
 	done
 
-	uci -q delete "$CONFIG.$section.dns_server" 2>/dev/null || true
-	uci -q delete "$CONFIG.$section.dns_ref" 2>/dev/null || true
+	uci -q delete "$CONFIG.$client_section_name.dns_server" 2>/dev/null || true
+	uci -q delete "$CONFIG.$client_section_name.dns_ref" 2>/dev/null || true
 	for dns_server in "$@"; do
-		uci add_list "$CONFIG.$section.dns_server=$dns_server"
+		uci add_list "$CONFIG.$client_section_name.dns_server=$dns_server"
 	done
 	uci commit "$CONFIG"
 	write_config
@@ -554,43 +612,67 @@ set_client_dns() {
 clear_client_dns() {
 	client_ip="$1"
 	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
-	section="$(client_section_by_ip "$client_ip" || true)"
-	[ -n "$section" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
-	uci -q delete "$CONFIG.$section.dns_server" 2>/dev/null || true
-	uci -q delete "$CONFIG.$section.dns_ref" 2>/dev/null || true
+	client_section_name="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$client_section_name" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
+	uci -q delete "$CONFIG.$client_section_name.dns_server" 2>/dev/null || true
+	uci -q delete "$CONFIG.$client_section_name.dns_ref" 2>/dev/null || true
 	uci commit "$CONFIG"
 	write_config
+}
+
+check_client_dns_ref() {
+	client_ip="$1"
+	dns_ref="$2"
+	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
+	client_section_name="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$client_section_name" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
+	case "$dns_ref" in default|"") return 0 ;; esac
+	dns_profile_exists "$dns_ref" || case "$dns_ref" in standard|unblock) ;; *) printf 'ERROR: bad dns ref\n' >&2; exit 1 ;; esac
+	dns_server="$(dns_profile_server "$dns_ref")"
+	validate_dns_server_spec "$dns_server" || { printf 'ERROR: bad dns profile server\n' >&2; exit 1; }
+}
+
+apply_client_dns_ref_no_write() {
+	client_ip="$1"
+	dns_ref="$2"
+	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
+	client_section_name="$(client_section_by_ip "$client_ip" || true)"
+	[ -n "$client_section_name" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
+	case "$dns_ref" in
+		default|"")
+			uci -q delete "$CONFIG.$client_section_name.dns_server" 2>/dev/null || true
+			uci -q delete "$CONFIG.$client_section_name.dns_ref" 2>/dev/null || true
+			return
+			;;
+	esac
+	uci set "$CONFIG.$client_section_name.dns_ref=$dns_ref"
+	uci -q delete "$CONFIG.$client_section_name.dns_server" 2>/dev/null || true
 }
 
 set_client_dns_ref() {
 	client_ip="$1"
 	dns_ref="$2"
-	validate_ip4 "$client_ip" || { printf 'ERROR: bad ip\n' >&2; exit 1; }
-	section="$(client_section_by_ip "$client_ip" || true)"
-	[ -n "$section" ] || { printf 'ERROR: client not found\n' >&2; exit 1; }
-	case "$dns_ref" in default|"") clear_client_dns "$client_ip"; return ;; esac
-	dns_profile_exists "$dns_ref" || case "$dns_ref" in standard|unblock) ;; *) printf 'ERROR: bad dns ref\n' >&2; exit 1 ;; esac
-	dns_server="$(dns_profile_server "$dns_ref")"
-	validate_dns_server_spec "$dns_server" || { printf 'ERROR: bad dns profile server\n' >&2; exit 1; }
-	if dns_server_is_lan "$dns_server"; then
-		check_dns_server_direct "$dns_server" 18053 || {
-			printf 'ERROR: dns check failed direct: %s\n' "$dns_server" >&2
-			exit 1
-		}
-	else
-		check_host="$(client_socks_host "$section")"
-		check_port="$(client_socks_port "$section")"
-		if ! validate_socks_host "$check_host" || ! validate_port "$check_port"; then
-			check_host="$(socks_host)"
-			check_port="$(socks_port)"
-		fi
-		check_dns_server_through_socks "$dns_server" "$check_host" "$check_port" 18053 || {
-			printf 'ERROR: dns check failed via %s:%s: %s\n' "$check_host" "$check_port" "$dns_server" >&2
-			exit 1
-		}
-	fi
-	uci set "$CONFIG.$section.dns_ref=$dns_ref"
-	uci -q delete "$CONFIG.$section.dns_server" 2>/dev/null || true
+	check_client_dns_ref "$client_ip" "$dns_ref"
+	apply_client_dns_ref_no_write "$client_ip" "$dns_ref"
+	uci commit "$CONFIG"
+	write_config
+}
+
+set_client_dns_ref_batch() {
+	[ "$#" -gt 0 ] || { printf 'ERROR: missing client dns refs\n' >&2; exit 1; }
+	[ $(( $# % 2 )) -eq 0 ] || { printf 'ERROR: expected IP DNS_REF pairs\n' >&2; exit 1; }
+	pairs="$*"
+
+	while [ "$#" -gt 0 ]; do
+		check_client_dns_ref "$1" "$2"
+		shift 2
+	done
+
+	set -- $pairs
+	while [ "$#" -gt 0 ]; do
+		apply_client_dns_ref_no_write "$1" "$2"
+		shift 2
+	done
 	uci commit "$CONFIG"
 	write_config
 }
@@ -706,15 +788,22 @@ remove_client_profile() {
 	done
 }
 
-delete_hook_rules() {
-	chain="$1"
-	comment="$2"
-	nft -a list chain "$(family)" "$(table)" "$chain" 2>/dev/null |
-		sed -n "/$comment/s/.* handle \\([0-9][0-9]*\\).*/\\1/p" |
+delete_nft_rules() {
+	delete_fam="$1"
+	delete_tbl="$2"
+	delete_chain="$3"
+	delete_comment="$4"
+
+	nft -a list chain "$delete_fam" "$delete_tbl" "$delete_chain" 2>/dev/null |
+		sed -n "/$delete_comment/s/.* handle \\([0-9][0-9]*\\).*/\\1/p" |
 		while read -r handle; do
 			[ -n "$handle" ] || continue
-			nft delete rule "$(family)" "$(table)" "$chain" handle "$handle" 2>/dev/null || true
+			nft delete rule "$delete_fam" "$delete_tbl" "$delete_chain" handle "$handle" 2>/dev/null || true
 		done
+}
+
+delete_hook_rules() {
+	delete_nft_rules "$(family)" "$(table)" "$1" "$2"
 }
 
 set_has_counter() {
@@ -755,6 +844,9 @@ runtime_ready() {
 	nft list set "$fam" "$tbl" "$set" >/dev/null 2>&1 || return 1
 	nft list chain "$fam" "$tbl" "$nat_hook" 2>/dev/null | grep -q "$NAT_HOOK_COMMENT" || return 1
 	nft list chain "$fam" "$tbl" "$mangle_hook" 2>/dev/null | grep -q "$MANGLE_HOOK_COMMENT" || return 1
+	if realip_dns_enabled; then
+		sockroute_dns_hijack_ready || return 1
+	fi
 	return 0
 }
 
@@ -795,7 +887,10 @@ setup_nft() {
 	fi
 
 	add_dns_realip_rules "$fam" "$tbl" "$set"
-	add_sockroute_dns_hijack_rules "$fam" "$tbl" "$set" "$nat" "$mangle" "$lan"
+	delete_hook_rules "$nat" "$SOCKROUTE_DNS_HIJACK_COMMENT"
+	add_sockroute_dns_hijack_rules "$fam" "$tbl" "$set" "$mangle" "$lan"
+	cleanup_dns_hijack_redirect_rules
+	add_dns_hijack_redirect_rules "$lan"
 
 	nft add rule "$fam" "$tbl" "$nat" \
 		iifname "$lan" ip saddr "@$set" ip daddr != "$cidr" ip protocol tcp \
@@ -816,6 +911,7 @@ setup_nft() {
 	for saved_ip in $(uci -q get "$CONFIG.$SECTION.client" 2>/dev/null || true); do
 		validate_ip4 "$saved_ip" || continue
 		nft add element "$fam" "$tbl" "$set" "{ $saved_ip }" 2>/dev/null || true
+		add_dns_hijack_element "$saved_ip"
 	done
 }
 
@@ -831,6 +927,7 @@ teardown_nft() {
 	delete_hook_rules "$nat_hook" "$NAT_HOOK_COMMENT"
 	delete_hook_rules "$mangle_hook" "$MANGLE_HOOK_COMMENT"
 	delete_dns_realip_rules
+	cleanup_dns_hijack_redirect_rules
 	delete_hook_rules "$nat_hook" "$LEGACY_NAT_HOOK_COMMENT"
 	delete_hook_rules "$mangle_hook" "$LEGACY_MANGLE_HOOK_COMMENT"
 
@@ -839,6 +936,7 @@ teardown_nft() {
 	nft flush chain "$fam" "$tbl" "$mangle" 2>/dev/null || true
 	nft delete chain "$fam" "$tbl" "$mangle" 2>/dev/null || true
 	nft delete set "$fam" "$tbl" "$set" 2>/dev/null || true
+	delete_dns_hijack_set
 	nft flush chain "$fam" "$tbl" FORCE_VPN_NAT 2>/dev/null || true
 	nft delete chain "$fam" "$tbl" FORCE_VPN_NAT 2>/dev/null || true
 	nft flush chain "$fam" "$tbl" FORCE_VPN_MANGLE 2>/dev/null || true
@@ -2146,6 +2244,7 @@ add_client() {
 	}
 	ensure_runtime_ready
 	nft add element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" 2>/dev/null || true
+	add_dns_hijack_element "$client_ip"
 	if ! uci -q get "$CONFIG.$SECTION.client" 2>/dev/null | tr ' ' '\n' | grep -qx "$client_ip"; then
 		uci add_list "$CONFIG.$SECTION.client=$client_ip"
 	fi
@@ -2168,6 +2267,7 @@ del_client() {
 		exit 1
 	}
 	nft delete element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" 2>/dev/null || true
+	del_dns_hijack_element "$client_ip"
 	uci -q del_list "$CONFIG.$SECTION.client=$client_ip" 2>/dev/null || true
 	uci commit "$CONFIG"
 	log "disabled SockRoute for $client_ip"
@@ -2187,6 +2287,7 @@ delete_client() {
 		exit 1
 	}
 	nft delete element "$(family)" "$(table)" "$(set_name)" "{ $client_ip }" 2>/dev/null || true
+	del_dns_hijack_element "$client_ip"
 	uci -q del_list "$CONFIG.$SECTION.client=$client_ip" 2>/dev/null || true
 	uci add_list "$CONFIG.$SECTION.hidden_client=$client_ip" 2>/dev/null || true
 	remove_client_profile "$client_ip"
@@ -2288,10 +2389,11 @@ case "${1:-}" in
 	set-client-socks-ref|set_client_socks_ref) with_lock set_client_socks_ref "${2:-}" "${3:-}" ;;
 	clear-client-socks|clear_client_socks) with_lock clear_client_socks "${2:-}" ;;
 	set-client-dns-ref|set_client_dns_ref) with_lock set_client_dns_ref "${2:-}" "${3:-}" ;;
+	set-client-dns-ref-batch|set_client_dns_ref_batch) shift; with_lock set_client_dns_ref_batch "$@" ;;
 	set-client-dns|set_client_dns) shift; client_ip="${1:-}"; shift || true; with_lock set_client_dns "$client_ip" "$@" ;;
 	clear-client-dns|clear_client_dns) with_lock clear_client_dns "${2:-}" ;;
 	*)
-		printf 'Usage: %s setup|teardown|ready|write-config|socks-list|socks-profiles|dns-profiles|set-socks-profile SECTION LABEL HOST PORT|set-socks-ref SECTION|set-socks HOST PORT|set-default-dns DNS|set-dns-profile SECTION LABEL DNS|set-dns-ref SECTION|test-dns-profile SECTION|test-socks HOST PORT|test-socks-ident HOST PORT|set-client-socks IP HOST PORT|set-client-socks-ref IP SECTION|clear-client-socks IP|set-client-dns-ref IP SECTION|default|set-client-dns IP DNS...|clear-client-dns IP|health|dhcp-list|check-client IP|add IP|add-named IP LABEL|del IP|delete-client IP|rename IP LABEL|has IP|list\n' "$0" >&2
+		printf 'Usage: %s setup|teardown|ready|write-config|socks-list|socks-profiles|dns-profiles|set-socks-profile SECTION LABEL HOST PORT|set-socks-ref SECTION|set-socks HOST PORT|set-default-dns DNS|set-dns-profile SECTION LABEL DNS|set-dns-ref SECTION|test-dns-profile SECTION|test-socks HOST PORT|test-socks-ident HOST PORT|set-client-socks IP HOST PORT|set-client-socks-ref IP SECTION|clear-client-socks IP|set-client-dns-ref IP SECTION|set-client-dns-ref-batch IP SECTION...|default|set-client-dns IP DNS...|clear-client-dns IP|health|dhcp-list|check-client IP|add IP|add-named IP LABEL|del IP|delete-client IP|rename IP LABEL|has IP|list\n' "$0" >&2
 		exit 2
 		;;
 esac

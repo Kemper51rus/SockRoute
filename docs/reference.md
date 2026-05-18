@@ -169,13 +169,13 @@ DNS-перехват:
 
 ```sh
 /usr/libexec/sockroute check-client 192.168.1.100
-nft list chain inet fw4 SOCKROUTE_NAT
-nft list chain inet fw4 SOCKROUTE_MANGLE
+nft list chain inet "$(uci -q get sockroute.main.dns_hijack_table)" "$(uci -q get sockroute.main.dns_hijack_chain)"
+nft list chain inet "$(uci -q get sockroute.main.nft_table)" "$(uci -q get sockroute.main.nft_mangle_chain)"
 ```
 
-При включённом `realip_dns` в обеих цепочках должен быть комментарий `sockroute_dns_hijack`: в `SOCKROUTE_MANGLE` UDP/53 возвращается из tproxy-цепочки, а в `SOCKROUTE_NAT` UDP/TCP 53 перенаправляется на `:<dns_port>`. Это важно для outbound, где SOCKS endpoint не обслуживает UDP DNS стабильно.
+При включённом `realip_dns` комментарий `sockroute_dns_hijack` должен быть в рабочей NAT-цепочке `dns_hijack_table/dns_hijack_chain` и в `SOCKROUTE_MANGLE`. Если установка использует PassWall2 hook-цепочки, installer ставит DNS redirect в `inet passwall2 dstnat`; иначе используется `inet fw4 dstnat` и отдельный set `sockroute_dns_clients`. В `SOCKROUTE_MANGLE` UDP/53 возвращается из tproxy-цепочки, а в NAT UDP/TCP 53 перенаправляется на `:<dns_port>`. Это важно для outbound, где SOCKS endpoint не обслуживает UDP DNS стабильно.
 
-При сохранении `dns_server` для клиента SockRoute проверяет каждый указанный DNS через временный локальный `sing-box` и тот же SOCKS outbound, который назначен этому клиенту. Если хотя бы один DNS не отвечает через этот SOCKS, список не сохраняется. В рабочем `/etc/sockroute/sing-box.json` DNS-серверы клиента получают `detour` на тот же SOCKS outbound.
+DNS-профили проверяются отдельно через LuCI/CLI, поэтому выбор DNS для клиента сохраняется без сетевой проверки и не блокирует массовые изменения. В рабочем `/etc/sockroute/sing-box.json` DNS-серверы клиента получают `detour` на тот же SOCKS outbound.
 
 ```sh
 /usr/libexec/sockroute set-client-dns 192.168.1.100 https://example.com/dns-query tls://dns.example.net
@@ -231,3 +231,5 @@ uci -q get sockroute.main.nft_table
 uci -q get sockroute.main.nft_nat_hook_chain
 uci -q get sockroute.main.nft_mangle_hook_chain
 ```
+
+При старте init-скрипт ждёт настроенные hook-цепочки до `sockroute.main.boot_wait_timeout` секунд (по умолчанию 180). Это нужно для PassWall2, который может создавать `PSW2_NAT`/`PSW2_MANGLE` с задержкой. Если PSW2 hook-цепочки так и не появились, но стандартные `fw4 dstnat` и `fw4 mangle_prerouting` доступны, SockRoute переключается на `fw4` и стартует без PassWall2.

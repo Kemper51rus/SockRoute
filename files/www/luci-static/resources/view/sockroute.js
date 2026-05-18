@@ -1866,7 +1866,7 @@ return view.extend({
 
 	stageClientChange: function(client, key, value) {
 		var pending = this.pendingClientChanges();
-		var marker;
+		var row;
 
 		if (!validateIp4(client.ip)) {
 			ui.addNotification(null, E('p', 'Неверный IPv4-адрес клиента.'), 'danger');
@@ -1877,9 +1877,9 @@ return view.extend({
 			pending[client.ip] = { label: client.label || client.ip };
 		pending[client.ip][key] = value;
 
-		marker = document.getElementById('sockroute-client-pending-%s'.format(domId(client.ip)));
-		if (marker)
-			marker.textContent = 'есть изменения';
+		row = document.getElementById('sockroute-client-row-%s'.format(domId(client.ip)));
+		if (row)
+			row.style.background = 'rgba(234,179,8,.22)';
 		this.updatePendingClientUi();
 		ui.addNotification(null, E('p', 'Изменение клиента "%s" ожидает сохранения.'.format(client.label || client.ip)), 'info');
 		return Promise.resolve();
@@ -1890,6 +1890,7 @@ return view.extend({
 		var socksProfiles = this.socksProfiles || [];
 		var ips = [];
 		var sequence = Promise.resolve();
+		var dnsBatch = [];
 
 		for (var ip in pending)
 			if (pending.hasOwnProperty(ip))
@@ -1929,24 +1930,33 @@ return view.extend({
 
 				ui.addNotification(null, E('p', 'Неверный исходящий SOCKS для %s.'.format(ip)), 'danger');
 				return Promise.reject(new Error('bad pending socks'));
-			}, this)).then(L.bind(function() {
-				var value = change.dns;
-
-				if (value == null)
-					return Promise.resolve();
-				if (!value)
-					return this.runCommand(helperPath, [ 'clear-client-dns', ip ]);
-				if (value === 'manual') {
-					ui.addNotification(null, E('p', 'Manual DNS для %s меняется через Edit.'.format(ip)), 'danger');
-					return Promise.reject(new Error('bad pending dns'));
-				}
-				return this.runCommand(helperPath, [ 'set-client-dns-ref', ip, value ]);
 			}, this));
+
+			if (change.dns != null) {
+				if (change.dns === 'manual') {
+					ui.addNotification(null, E('p', 'Manual DNS для %s меняется через Edit.'.format(ip)), 'danger');
+					sequence = sequence.then(function() {
+						return Promise.reject(new Error('bad pending dns'));
+					});
+				}
+				else {
+					dnsBatch.push(ip, change.dns || 'default');
+				}
+			}
 		}, this));
 
 		return sequence.then(L.bind(function() {
+			if (dnsBatch.length)
+				return this.runCommand(helperPath, [ 'set-client-dns-ref-batch' ].concat(dnsBatch));
+			return Promise.resolve();
+		}, this)).then(L.bind(function() {
 			return this.runCommand(initPath, [ 'restart' ]);
 		}, this)).then(L.bind(function() {
+			ips.forEach(function(ip) {
+				var row = document.getElementById('sockroute-client-row-%s'.format(domId(ip)));
+				if (row)
+					row.style.background = '';
+			});
 			window.sockroutePendingClientChanges = {};
 			window.sockrouteAutoApplyBusy = false;
 			return this.notifyAndRefresh('Изменения клиентов сохранены, SockRoute перезапущен.');
@@ -1990,6 +2000,22 @@ return view.extend({
 
 		window.sockrouteAutoApplyBusy = true;
 		return sequence.then(L.bind(function() {
+			if (ip === client.ip)
+				return Promise.resolve();
+			if (client.socksRef)
+				return this.runCommand(helperPath, [ 'set-client-socks-ref', ip, client.socksRef ]);
+			if (client.socksHost && client.socksPort)
+				return this.runCommand(helperPath, [ 'set-client-socks', ip, client.socksHost, client.socksPort ]);
+			return Promise.resolve();
+		}, this)).then(L.bind(function() {
+			if (ip === client.ip)
+				return Promise.resolve();
+			if ((client.dnsServers || []).length)
+				return this.runCommand(helperPath, [ 'set-client-dns', ip ].concat(client.dnsServers || []));
+			if (client.dnsRef)
+				return this.runCommand(helperPath, [ 'set-client-dns-ref', ip, client.dnsRef ]);
+			return Promise.resolve();
+		}, this)).then(L.bind(function() {
 			return this.runCommand(initPath, [ 'restart' ]);
 		}, this)).then(L.bind(function() {
 			if (!value) {
@@ -2072,33 +2098,9 @@ return view.extend({
 		}, this));
 	},
 
-	handleEditClient: function(client, socksProfiles, socksCandidates, defaultSocksHost, defaultSocksPort) {
+	handleEditClient: function(client) {
 		var labelId = 'sockroute-edit-label';
 		var ipId = 'sockroute-edit-ip';
-		var socksSelectId = 'sockroute-edit-socks-candidate';
-		var socksHostId = 'sockroute-edit-socks-host';
-		var socksPortId = 'sockroute-edit-socks-port';
-		var dnsServersId = 'sockroute-edit-dns-servers';
-		var selectedSocks = client.socksRef ? 'ref|' + client.socksRef : client.socksHost && client.socksPort ? rawSocksValue(client.socksHost, client.socksPort) : '';
-		var socksOptions = [
-			E('option', { 'value': '' }, [ 'Использовать SOCKS по умолчанию' ])
-		].concat((socksProfiles || []).map(function(profile) {
-			var value = socksProfileValue(profile);
-			var text = '%s - %s:%s'.format(profile.label, profile.host, profile.port);
-			var attrs = { 'value': value };
-
-			if (value === selectedSocks)
-				attrs.selected = 'selected';
-			return E('option', attrs, [ text ]);
-		})).concat((socksCandidates || []).map(function(candidate) {
-			var value = rawSocksValue(candidate.host, candidate.port);
-			var text = '%s:%s - [%s] %s'.format(candidate.host, candidate.port, socksCandidateBadge(candidate), candidate.label);
-			var attrs = { 'value': value };
-
-			if (value === selectedSocks)
-				attrs.selected = 'selected';
-			return E('option', attrs, [ text ]);
-		}));
 
 		ui.showModal('Редактировать клиента', [
 			E('div', { 'class': 'cbi-map' }, [
@@ -2124,58 +2126,6 @@ return view.extend({
 								'value': client.ip
 							})
 						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title', 'for': socksSelectId }, [ 'Исходящие SOCKS' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('select', {
-								'id': socksSelectId,
-								'class': 'cbi-input-select',
-								'style': 'width:100%; max-width:42em;',
-								'change': function(ev) {
-									fillSocksInputIds(ev.target.value, socksHostId, socksPortId, socksProfiles);
-								}
-							}, socksOptions)
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title', 'for': dnsServersId }, [ 'DNS серверы' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('textarea', {
-								'id': dnsServersId,
-								'class': 'cbi-input-textarea',
-								'style': 'width:100%; max-width:42em; min-height:5em;',
-								'placeholder': 'udp://1.1.1.1\ntls://1.1.1.1\nhttps://1.1.1.1/dns-query'
-							}, [ (client.dnsServers || []).join('\n') ]),
-							E('div', { 'class': 'cbi-value-description' }, [
-								'Один или несколько DNS для клиента. Форматы: UDP/TLS/HTTPS, например 1.1.1.1, udp://8.8.8.8, tls://1.1.1.1, https://1.1.1.1/dns-query. Пусто — default DNS: %s.'.format(uci.get('sockroute', 'main', 'default_dns_server') || ('udp://' + (uci.get('sockroute', 'main', 'realip_dns_addr') || '1.1.1.1')))
-							])
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title', 'for': socksHostId }, [ 'SOCKS IP' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('input', {
-								'id': socksHostId,
-								'type': 'text',
-								'class': 'cbi-input-text',
-								'style': 'width:100%; max-width:14em;',
-								'value': client.socksHost || '',
-								'placeholder': defaultSocksHost || 'по умолчанию'
-							}),
-							' ',
-							E('input', {
-								'id': socksPortId,
-								'type': 'text',
-								'class': 'cbi-input-text',
-								'style': 'width:8em;',
-								'value': client.socksPort || '',
-								'placeholder': defaultSocksPort || 'порт'
-							}),
-							E('div', { 'class': 'cbi-value-description' }, [
-								'Оставьте оба поля пустыми, чтобы клиент использовал глобальный SOCKS.'
-							])
-						])
 					])
 				])
 			]),
@@ -2187,7 +2137,7 @@ return view.extend({
 				' ',
 				E('button', {
 					'class': 'btn cbi-button-save important',
-					'click': ui.createHandlerFn(this, 'handleEditClientSave', client, labelId, ipId, socksSelectId, socksHostId, socksPortId, dnsServersId, defaultSocksHost, defaultSocksPort)
+					'click': ui.createHandlerFn(this, 'handleEditClientSave', client, labelId, ipId)
 				}, [ 'Сохранить' ])
 			])
 		]);
@@ -2197,38 +2147,16 @@ return view.extend({
 			input.focus();
 	},
 
-	handleEditClientSave: function(client, labelId, ipId, socksSelectId, socksHostId, socksPortId, dnsServersId, defaultSocksHost, defaultSocksPort) {
+	handleEditClientSave: function(client, labelId, ipId) {
 		var labelInput = document.getElementById(labelId);
 		var ipInput = document.getElementById(ipId);
-		var socksSelect = document.getElementById(socksSelectId);
-		var socksHostInput = document.getElementById(socksHostId);
-		var socksPortInput = document.getElementById(socksPortId);
-		var dnsServersInput = document.getElementById(dnsServersId);
 		var label = labelInput ? labelInput.value.trim() : '';
 		var ip = ipInput ? ipInput.value.trim() : '';
-		var selectedSocks = socksSelect ? socksSelect.value : '';
-		var selectedRef = selectedSocks.indexOf('ref|') === 0 ? selectedSocks.split('|')[1] : '';
-		var socksHost = socksHostInput ? socksHostInput.value.trim() : '';
-		var socksPort = socksPortInput ? socksPortInput.value.trim() : '';
-		var dnsServers = splitList(dnsServersInput ? dnsServersInput.value : '');
-		var customSocks = socksHost || socksPort;
 		var sequence;
 
 		if (!validateIp4(ip)) {
 			ui.addNotification(null, E('p', 'Неверный IPv4-адрес.'), 'danger');
 			return Promise.resolve();
-		}
-
-		if (customSocks && (!validateIp4(socksHost) || !validatePort(socksPort))) {
-			ui.addNotification(null, E('p', 'SOCKS клиента должен быть пустым или задан как IPv4 + порт.'), 'danger');
-			return Promise.resolve();
-		}
-
-		for (var i = 0; i < dnsServers.length; i++) {
-			if (!validateDnsServerSpec(dnsServers[i])) {
-				ui.addNotification(null, E('p', 'Неверный DNS сервер: %s'.format(dnsServers[i])), 'danger');
-				return Promise.resolve();
-			}
 		}
 
 		label = label || ip;
@@ -2244,18 +2172,6 @@ return view.extend({
 		}
 
 		return sequence.then(L.bind(function() {
-			if (selectedRef)
-				return this.runCommand(helperPath, [ 'set-client-socks-ref', ip, selectedRef ]);
-			if (!customSocks || (socksHost === defaultSocksHost && socksPort === String(defaultSocksPort)))
-				return this.runCommand(helperPath, [ 'clear-client-socks', ip ]);
-			return this.runCommand(helperPath, [ 'set-client-socks', ip, socksHost, socksPort ]);
-		}, this)).then(L.bind(function() {
-			if (dnsServers.length)
-				return this.runCommand(helperPath, [ 'set-client-dns', ip ].concat(dnsServers));
-			if (client.dnsRef)
-				return this.runCommand(helperPath, [ 'set-client-dns-ref', ip, client.dnsRef ]);
-			return this.runCommand(helperPath, [ 'clear-client-dns', ip ]);
-		}, this)).then(L.bind(function() {
 			return this.runCommand(initPath, [ 'restart' ]);
 		}, this)).then(L.bind(function() {
 			ui.hideModal();
@@ -2960,7 +2876,10 @@ return view.extend({
 		if (selectedDns === 'manual')
 			dnsOptions.push(E('option', { 'value': 'manual', 'selected': 'selected', 'disabled': 'disabled' }, [ 'manual' ]));
 
-		return E('tr', stripedRowAttrs(index || 0, client.active ? 'background:rgba(22,163,74,.12);' : ''), [
+		var rowAttrs = stripedRowAttrs(index || 0, this.pendingClientChanges()[client.ip] ? 'background:rgba(234,179,8,.22);' : client.active ? 'background:rgba(22,163,74,.12);' : '');
+		rowAttrs.id = 'sockroute-client-row-%s'.format(domId(client.ip));
+
+		return E('tr', rowAttrs, [
 			E('td', {}, [ client.label ]),
 			E('td', {}, [ client.ip ]),
 			E('td', {}, [ routeBadge(client.active) ]),
@@ -2993,11 +2912,6 @@ return view.extend({
 				'style': 'white-space:nowrap;'
 			}, [ trafficCellContent(client) ]),
 			E('td', { 'class': 'right' }, [
-				!this.autoApply ? E('span', {
-					'id': 'sockroute-client-pending-%s'.format(domId(client.ip)),
-					'class': 'ifacebadge inactive',
-					'style': 'margin-right:6px;'
-				}, [ '' ]) : '',
 				E('button', {
 					'class': 'btn cbi-button-edit',
 					'click': ui.createHandlerFn(this, 'handleEditClient', client, this.socksProfiles || [], this.socksCandidates || [], this.defaultSocksHost || '', this.defaultSocksPort || '')

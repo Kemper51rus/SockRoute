@@ -124,11 +124,17 @@ configure_nft_hooks() {
 		uci set sockroute.main.nft_table='passwall2'
 		uci set sockroute.main.nft_nat_hook_chain='PSW2_NAT'
 		uci set sockroute.main.nft_mangle_hook_chain='PSW2_MANGLE'
+		uci set sockroute.main.dns_hijack_table='passwall2'
+		uci set sockroute.main.dns_hijack_set='sockroute_clients'
+		uci set sockroute.main.dns_hijack_chain='dstnat'
 	elif nft list chain inet fw4 dstnat >/dev/null 2>&1 &&
 		nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1; then
 		uci set sockroute.main.nft_table='fw4'
 		uci set sockroute.main.nft_nat_hook_chain='dstnat'
 		uci set sockroute.main.nft_mangle_hook_chain='mangle_prerouting'
+		uci set sockroute.main.dns_hijack_table='fw4'
+		uci set sockroute.main.dns_hijack_set='sockroute_dns_clients'
+		uci set sockroute.main.dns_hijack_chain='dstnat'
 	else
 		log "WARN: no known nft hook chains found; configure sockroute.main.nft_table and hook chains manually"
 	fi
@@ -149,6 +155,7 @@ ensure_config() {
 	uci -q get sockroute.main.default_dns_server >/dev/null 2>&1 || uci set sockroute.main.default_dns_server="udp://$(uci -q get sockroute.main.realip_dns_addr 2>/dev/null || printf '1.1.1.1')"
 	uci -q get sockroute.main.auto_apply >/dev/null 2>&1 || uci set sockroute.main.auto_apply='0'
 	uci -q get sockroute.main.check_loop >/dev/null 2>&1 || uci set sockroute.main.check_loop='0'
+	uci -q get sockroute.main.boot_wait_timeout >/dev/null 2>&1 || uci set sockroute.main.boot_wait_timeout='180'
 	uci -q get sockroute.main.socks_check_interval >/dev/null 2>&1 || uci set sockroute.main.socks_check_interval='30'
 	uci -q get sockroute.main.dns_check_interval >/dev/null 2>&1 || uci set sockroute.main.dns_check_interval='30'
 	uci -q get sockroute.main.dns_standard_label >/dev/null 2>&1 || uci set sockroute.main.dns_standard_label='DNS standard'
@@ -165,6 +172,10 @@ ensure_config() {
 	uci set sockroute.main.nft_nat_chain='SOCKROUTE_NAT'
 	uci set sockroute.main.nft_mangle_chain='SOCKROUTE_MANGLE'
 	uci set sockroute.main.nft_mark='0x50535732'
+	uci -q get sockroute.main.dns_hijack_family >/dev/null 2>&1 || uci set sockroute.main.dns_hijack_family='inet'
+	uci -q get sockroute.main.dns_hijack_table >/dev/null 2>&1 || uci set sockroute.main.dns_hijack_table='fw4'
+	uci -q get sockroute.main.dns_hijack_set >/dev/null 2>&1 || uci set sockroute.main.dns_hijack_set='sockroute_dns_clients'
+	uci -q get sockroute.main.dns_hijack_chain >/dev/null 2>&1 || uci set sockroute.main.dns_hijack_chain='dstnat'
 	configure_nft_hooks
 	uci commit sockroute
 

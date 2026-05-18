@@ -21,6 +21,53 @@ enabled() {
 	esac
 }
 
+nft_hooks_exist() {
+	nft list chain "$1" "$2" "$3" >/dev/null 2>&1 &&
+		nft list chain "$1" "$2" "$4" >/dev/null 2>&1
+}
+
+use_fw4_hooks() {
+	nft_hooks_exist inet fw4 dstnat mangle_prerouting || return 1
+	uci set "$CONFIG.$SECTION.nft_family=inet"
+	uci set "$CONFIG.$SECTION.nft_table=fw4"
+	uci set "$CONFIG.$SECTION.nft_nat_hook_chain=dstnat"
+	uci set "$CONFIG.$SECTION.nft_mangle_hook_chain=mangle_prerouting"
+	uci set "$CONFIG.$SECTION.dns_hijack_family=inet"
+	uci set "$CONFIG.$SECTION.dns_hijack_table=fw4"
+	uci set "$CONFIG.$SECTION.dns_hijack_set=sockroute_dns_clients"
+	uci set "$CONFIG.$SECTION.dns_hijack_chain=dstnat"
+	uci commit "$CONFIG"
+	logger -t sockroute "PSW2 hooks not found; using fw4 hooks"
+	return 0
+}
+
+wait_for_nft_hooks() {
+	fam="$(cfg nft_family inet)"
+	tbl="$(cfg nft_table fw4)"
+	nat_hook="$(cfg nft_nat_hook_chain dstnat)"
+	mangle_hook="$(cfg nft_mangle_hook_chain mangle_prerouting)"
+	timeout="$(cfg boot_wait_timeout 180)"
+
+	case "$timeout" in
+		""|*[!0-9]*) timeout=180 ;;
+	esac
+
+	i=0
+	while [ "$i" -lt "$timeout" ]; do
+		if nft_hooks_exist "$fam" "$tbl" "$nat_hook" "$mangle_hook"; then
+			return 0
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if nft_hooks_exist "$fam" "$tbl" "$nat_hook" "$mangle_hook"; then
+		return 0
+	fi
+
+	use_fw4_hooks
+}
+
 start_service() {
 	enabled || return 0
 	[ -x "$HELPER" ] || return 1
@@ -31,6 +78,7 @@ start_service() {
 
 	"$HELPER" write-config
 	"$bin" check -c "$config_file" >/dev/null || return 1
+	wait_for_nft_hooks || return 1
 	"$HELPER" setup || return 1
 
 	procd_open_instance

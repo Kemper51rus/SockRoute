@@ -7,6 +7,7 @@ HELPER = ROOT / "files/usr/libexec/sockroute"
 LUCI = ROOT / "files/www/luci-static/resources/view/sockroute.js"
 CONFIG = ROOT / "files/etc/config/sockroute"
 INSTALLER = ROOT / "install.sh"
+INIT = ROOT / "files/etc/init.d/sockroute"
 
 
 def read(path):
@@ -19,6 +20,14 @@ class SockRouteFeatureTests(unittest.TestCase):
         self.assertIn("option realip_dns_addr '1.1.1.1'", read(CONFIG))
         self.assertIn("sockroute.main.realip_dns", read(INSTALLER))
         self.assertIn("sockroute.main.realip_dns_addr", read(INSTALLER))
+
+    def test_init_waits_for_psw2_and_can_fallback_to_fw4(self):
+        init = read(INIT)
+        self.assertIn("boot_wait_timeout 180", init)
+        self.assertIn("wait_for_nft_hooks()", init)
+        self.assertIn("use_fw4_hooks()", init)
+        self.assertIn("PSW2 hooks not found; using fw4 hooks", init)
+        self.assertIn("sockroute_dns_clients", init)
 
     def test_helper_has_no_fakeip_bypass_backend(self):
         helper = read(HELPER)
@@ -67,6 +76,8 @@ class SockRouteFeatureTests(unittest.TestCase):
         self.assertIn("set_dns_ref", helper)
         self.assertIn("set_dns_profile", helper)
         self.assertIn("set_client_dns_ref", helper)
+        self.assertIn("set_client_dns_ref_batch", helper)
+        self.assertIn("check_client_dns_ref", helper)
         self.assertIn("client_effective_dns_servers()", helper)
         self.assertIn("check_dns_server_through_socks()", helper)
         self.assertIn("dns_check_domain()", helper)
@@ -75,7 +86,11 @@ class SockRouteFeatureTests(unittest.TestCase):
         self.assertNotIn('dns_proto="$1"; server="$2"; port="$3"', helper)
         self.assertIn("SOCKROUTE_DNS_HIJACK_COMMENT", helper)
         self.assertIn("add_sockroute_dns_hijack_rules()", helper)
+        self.assertIn("add_dns_hijack_redirect_rules()", helper)
+        self.assertIn("dns_hijack_set()", helper)
+        self.assertIn("sockroute_dns_clients", helper)
         self.assertIn('udp dport 53 \\\n\t\tcounter return comment "$SOCKROUTE_DNS_HIJACK_COMMENT"', helper)
+        self.assertIn('delete_hook_rules "$nat" "$SOCKROUTE_DNS_HIJACK_COMMENT"', helper)
         self.assertIn('counter redirect to ":$port" comment "$SOCKROUTE_DNS_UDP_COMMENT"', helper)
         self.assertIn('"tag": "dns_in",\n      "listen": "::"', helper)
         self.assertIn("dns_port()", helper)
@@ -85,14 +100,12 @@ class SockRouteFeatureTests(unittest.TestCase):
     def test_luci_exposes_per_client_dns_without_fakeip_bypass_controls(self):
         luci = read(LUCI)
         for present in (
-            "sockroute-edit-dns-servers",
-            "DNS серверы",
             "DNS профили",
             "DNS standard",
             "DNS unblock",
-            "UDP/TLS/HTTPS",
             "set-client-dns",
             "set-client-dns-ref",
+            "set-client-dns-ref-batch",
             "set-dns-profile",
             "set-dns-ref",
             "test-dns-profile",
@@ -100,6 +113,7 @@ class SockRouteFeatureTests(unittest.TestCase):
             "clear-client-dns",
             "client.dnsServers",
             "client.dnsRef",
+            "dnsBatch",
             "handleEditDnsProfile",
             "handleSettingsModal",
             "handleAddClientModal",
@@ -110,6 +124,9 @@ class SockRouteFeatureTests(unittest.TestCase):
         ):
             self.assertIn(present, luci)
         for removed in (
+            "sockroute-edit-dns-servers",
+            "DNS серверы",
+            "UDP/TLS/HTTPS",
             "sockroute-bypass-cidr",
             "handleSaveRouting",
             "Bypass/FakeDNS",

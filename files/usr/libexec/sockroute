@@ -85,6 +85,10 @@ ip4_in_cidr() {
 	[ $((cidr_ip_int & cidr_mask)) -eq $((cidr_network_int & cidr_mask)) ]
 }
 
+ip4_is_loopback() {
+	ip4_in_cidr "$1" 127.0.0.0/8
+}
+
 validate_socks_host() {
 	validate_ip4 "$1"
 }
@@ -552,6 +556,7 @@ dns_server_host_from_spec() {
 dns_server_is_lan() {
 	host="$(dns_server_host_from_spec "$1")"
 	validate_ip4 "$host" || return 1
+	ip4_is_loopback "$host" && return 0
 	ip4_in_cidr "$host" "$(lan_cidr)"
 }
 

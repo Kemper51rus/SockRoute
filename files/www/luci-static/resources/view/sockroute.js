@@ -6,6 +6,9 @@
 
 var helperPath = '/usr/libexec/sockroute';
 var initPath = '/etc/init.d/sockroute';
+var failedCheckLimit = 3;
+var socksCheckFailures = {};
+var dnsCheckFailures = {};
 
 function asList(value) {
 	if (Array.isArray(value))
@@ -185,6 +188,65 @@ function parseSocksCandidates(value) {
 
 function sectionId(section) {
 	return section && (section['.name'] || section.name) || '';
+}
+
+function profileCheckKey(profile) {
+	if (!profile)
+		return '';
+	if (profile.section)
+		return profile.section;
+	if (profile.host || profile.port)
+		return '%s:%s'.format(profile.host || '', profile.port || '');
+	return profile.server || profile.label || '';
+}
+
+function profileFailureCount(bucket, profile) {
+	var key = profileCheckKey(profile);
+	var count = Number(bucket[key] || 0);
+
+	if (profile && profile.lastCheck === 'fail' && count < failedCheckLimit)
+		count = failedCheckLimit;
+
+	return count;
+}
+
+function profileCheckingState(bucket, profile) {
+	var count = profileFailureCount(bucket, profile);
+
+	return {
+		count: count,
+		status: count >= failedCheckLimit ? 'fail' : 'warn'
+	};
+}
+
+function recordProfileCheckState(bucket, profile, rawStatus) {
+	var key = profileCheckKey(profile);
+	var count;
+
+	if (rawStatus === 'ok') {
+		bucket[key] = 0;
+		return { count: 0, status: 'ok' };
+	}
+
+	count = profileFailureCount(bucket, profile) + 1;
+	bucket[key] = count;
+
+	return {
+		count: count,
+		status: count >= failedCheckLimit ? 'fail' : 'warn'
+	};
+}
+
+function checkStateTitle(detail, state) {
+	var title = detail || 'нет вывода';
+
+	if (!state || state.status === 'ok')
+		return title;
+
+	if (state.count >= failedCheckLimit)
+		return '%s / неудачных проверок подряд: %d'.format(title, state.count);
+
+	return '%s / неудачная попытка %d из %d'.format(title, state.count, failedCheckLimit);
 }
 
 function socksProfileValue(profile) {
@@ -974,9 +1036,16 @@ function refreshStatusCardsInBackground(expectedClients) {
 
 function refreshSocksProfileIdent(profile) {
 	var key = domId(profile.section);
+	var checking = profileCheckingState(socksCheckFailures, profile);
 
-	setStatusBadge('sockroute-socks-status-%s'.format(key), 'warn');
-	setNodeText('sockroute-socks-ident-%s'.format(key), 'проверка...', 'Проверка ident.me выполняется в фоне');
+	setStatusBadge('sockroute-socks-status-%s'.format(key), checking.status);
+	setNodeText(
+		'sockroute-socks-ident-%s'.format(key),
+		checking.status === 'fail' ? 'FAIL' : 'проверка...',
+		checking.status === 'fail'
+			? 'Повторная проверка ident.me выполняется в фоне; неудачных проверок подряд: %d'.format(checking.count)
+			: 'Проверка ident.me выполняется в фоне'
+	);
 
 	return L.resolveDefault(fs.exec(helperPath, [ 'test-socks-ident', profile.host, profile.port ]), {
 		code: 1,
@@ -987,18 +1056,20 @@ function refreshSocksProfileIdent(profile) {
 		var row = healthRowByName(rows, 'ident');
 		var detail = row.detail || res.stderr || 'нет вывода';
 		var identIp = identIpFromDetail(detail);
-		var status = row.status === 'ok' && identIp ? 'ok' : 'fail';
+		var rawStatus = row.status === 'ok' && identIp ? 'ok' : 'fail';
+		var state;
 
 		if (!rows.length)
 			detail = res.stderr || 'нет вывода';
 
-		setStatusBadge('sockroute-socks-status-%s'.format(key), status);
+		state = recordProfileCheckState(socksCheckFailures, profile, rawStatus);
+		setStatusBadge('sockroute-socks-status-%s'.format(key), state.status);
 		setNodeText(
 			'sockroute-socks-ident-%s'.format(key),
-			status === 'ok' ? identIp : 'FAIL',
-			'%s / обновлено %s'.format(detail, currentClock())
+			state.status === 'ok' ? identIp : state.status === 'fail' ? 'FAIL' : 'WARN',
+			'%s / обновлено %s'.format(checkStateTitle(detail, state), currentClock())
 		);
-		return status;
+		return state.status;
 	});
 }
 
@@ -1047,9 +1118,16 @@ function refreshSocksProfilesInBackground(profiles, retryFailed) {
 
 function refreshDnsProfileInBackground(profile) {
 	var key = domId(profile.section);
+	var checking = profileCheckingState(dnsCheckFailures, profile);
 
-	setStatusBadge('sockroute-dns-status-%s'.format(key), 'warn');
-	setNodeText('sockroute-dns-detail-%s'.format(key), 'проверка...', 'Проверка DNS выполняется в фоне');
+	setStatusBadge('sockroute-dns-status-%s'.format(key), checking.status);
+	setNodeText(
+		'sockroute-dns-detail-%s'.format(key),
+		checking.status === 'fail' ? 'FAIL' : 'проверка...',
+		checking.status === 'fail'
+			? 'Повторная проверка DNS выполняется в фоне; неудачных проверок подряд: %d'.format(checking.count)
+			: 'Проверка DNS выполняется в фоне'
+	);
 
 	return L.resolveDefault(fs.exec(helperPath, [ 'test-dns-profile', profile.section ]), {
 		code: 1,
@@ -1059,14 +1137,20 @@ function refreshDnsProfileInBackground(profile) {
 		var rows = parseHealth(res.stdout || '');
 		var row = healthRowByName(rows, 'dns');
 		var detail = row.detail || res.stderr || 'нет вывода';
-		var status = row.status === 'ok' ? 'ok' : 'fail';
+		var rawStatus = row.status === 'ok' ? 'ok' : 'fail';
+		var state;
 
 		if (!rows.length)
 			detail = res.stderr || 'нет вывода';
 
-		setStatusBadge('sockroute-dns-status-%s'.format(key), status);
-		setNodeText('sockroute-dns-detail-%s'.format(key), status === 'ok' ? 'OK' : 'FAIL', '%s / обновлено %s'.format(detail, currentClock()));
-		return status;
+		state = recordProfileCheckState(dnsCheckFailures, profile, rawStatus);
+		setStatusBadge('sockroute-dns-status-%s'.format(key), state.status);
+		setNodeText(
+			'sockroute-dns-detail-%s'.format(key),
+			state.status === 'ok' ? 'OK' : state.status === 'fail' ? 'FAIL' : 'WARN',
+			'%s / обновлено %s'.format(checkStateTitle(detail, state), currentClock())
+		);
+		return state.status;
 	});
 }
 

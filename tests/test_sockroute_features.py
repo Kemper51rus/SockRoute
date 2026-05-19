@@ -81,6 +81,8 @@ class SockRouteFeatureTests(unittest.TestCase):
         self.assertIn("client_effective_dns_servers()", helper)
         self.assertIn("check_dns_server_through_socks()", helper)
         self.assertIn("dns_check_domain()", helper)
+        self.assertIn("ip4_is_loopback()", helper)
+        self.assertIn('ip4_in_cidr "$1" 127.0.0.0/8', helper)
         self.assertIn('"tag": "check_socks"', helper)
         self.assertIn('"detour": "$detour"', helper)
         self.assertNotIn('dns_proto="$1"; server="$2"; port="$3"', helper)

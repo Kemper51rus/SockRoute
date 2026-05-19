@@ -1069,7 +1069,7 @@ function refreshSocksProfileIdent(profile) {
 			state.status === 'ok' ? identIp : state.status === 'fail' ? 'FAIL' : 'WARN',
 			'%s / обновлено %s'.format(checkStateTitle(detail, state), currentClock())
 		);
-		return state.status;
+		return { rawStatus: rawStatus, displayStatus: state.status };
 	});
 }
 
@@ -1091,11 +1091,13 @@ function refreshSocksProfilesInBackground(profiles, retryFailed) {
 	window.sockrouteSocksRefreshBusy = true;
 
 	(profiles || []).forEach(function(profile) {
-		checks.push(refreshSocksProfileIdent(profile).then(function(status) {
-			profile.lastCheck = status;
-			if (status !== 'ok')
+		checks.push(refreshSocksProfileIdent(profile).then(function(result) {
+			var rawStatus = result && result.rawStatus || 'fail';
+
+			profile.lastCheck = rawStatus;
+			if (rawStatus !== 'ok')
 				failedProfiles.push(profile);
-			return status;
+			return rawStatus;
 		}));
 	});
 
@@ -1150,7 +1152,7 @@ function refreshDnsProfileInBackground(profile) {
 			state.status === 'ok' ? 'OK' : state.status === 'fail' ? 'FAIL' : 'WARN',
 			'%s / обновлено %s'.format(checkStateTitle(detail, state), currentClock())
 		);
-		return state.status;
+		return { rawStatus: rawStatus, displayStatus: state.status };
 	});
 }
 
@@ -1172,11 +1174,13 @@ function refreshDnsProfilesInBackground(profiles, retryFailed) {
 	window.sockrouteDnsRefreshBusy = true;
 
 	(profiles || []).forEach(function(profile) {
-		checks.push(refreshDnsProfileInBackground(profile).then(function(status) {
-			profile.lastCheck = status;
-			if (status !== 'ok')
+		checks.push(refreshDnsProfileInBackground(profile).then(function(result) {
+			var rawStatus = result && result.rawStatus || 'fail';
+
+			profile.lastCheck = rawStatus;
+			if (rawStatus !== 'ok')
 				failedProfiles.push(profile);
-			return status;
+			return rawStatus;
 		}));
 	});
 

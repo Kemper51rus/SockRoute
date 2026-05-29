@@ -158,8 +158,8 @@ default_dns_server() {
 		printf 'udp://%s' "$(realip_dns_addr)"
 	fi
 }
-dns_standard_server() { cfg dns_standard_server 100.100.0.217; }
-dns_unblock_server() { cfg dns_unblock_server 100.100.0.156; }
+dns_standard_server() { cfg dns_standard_server 1.1.1.1; }
+dns_unblock_server() { cfg dns_unblock_server 8.8.8.8; }
 dns_profile_server() {
 	if dns_profile_exists "$1"; then
 		uci -q get "$CONFIG.$1.server" 2>/dev/null || true

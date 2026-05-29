@@ -159,9 +159,9 @@ ensure_config() {
 	uci -q get sockroute.main.socks_check_interval >/dev/null 2>&1 || uci set sockroute.main.socks_check_interval='30'
 	uci -q get sockroute.main.dns_check_interval >/dev/null 2>&1 || uci set sockroute.main.dns_check_interval='30'
 	uci -q get sockroute.main.dns_standard_label >/dev/null 2>&1 || uci set sockroute.main.dns_standard_label='DNS standard'
-	uci -q get sockroute.main.dns_standard_server >/dev/null 2>&1 || uci set sockroute.main.dns_standard_server='udp://100.100.0.217'
+	uci -q get sockroute.main.dns_standard_server >/dev/null 2>&1 || uci set sockroute.main.dns_standard_server='udp://1.1.1.1'
 	uci -q get sockroute.main.dns_unblock_label >/dev/null 2>&1 || uci set sockroute.main.dns_unblock_label='DNS unblock'
-	uci -q get sockroute.main.dns_unblock_server >/dev/null 2>&1 || uci set sockroute.main.dns_unblock_server='udp://100.100.0.156'
+	uci -q get sockroute.main.dns_unblock_server >/dev/null 2>&1 || uci set sockroute.main.dns_unblock_server='udp://8.8.8.8'
 	uci -q get sockroute.main.dns_port >/dev/null 2>&1 || uci set sockroute.main.dns_port='1053'
 	uci -q get sockroute.main.transparent_port >/dev/null 2>&1 || uci set sockroute.main.transparent_port="$(uci -q get sockroute.main.listen_port 2>/dev/null || printf '1042')"
 	uci -q get sockroute.main.listen_port >/dev/null 2>&1 || uci set sockroute.main.listen_port='1042'
@@ -202,10 +202,10 @@ ensure_config() {
 	if ! uci show sockroute 2>/dev/null | grep -q '=dns'; then
 		uci set sockroute.dns_standard='dns'
 		uci set sockroute.dns_standard.label="$(uci -q get sockroute.main.dns_standard_label 2>/dev/null || printf 'DNS standard')"
-		uci set sockroute.dns_standard.server="$(uci -q get sockroute.main.dns_standard_server 2>/dev/null || printf 'udp://100.100.0.217')"
+		uci set sockroute.dns_standard.server="$(uci -q get sockroute.main.dns_standard_server 2>/dev/null || printf 'udp://1.1.1.1')"
 		uci set sockroute.dns_unblock='dns'
 		uci set sockroute.dns_unblock.label="$(uci -q get sockroute.main.dns_unblock_label 2>/dev/null || printf 'DNS unblock')"
-		uci set sockroute.dns_unblock.server="$(uci -q get sockroute.main.dns_unblock_server 2>/dev/null || printf 'udp://100.100.0.156')"
+		uci set sockroute.dns_unblock.server="$(uci -q get sockroute.main.dns_unblock_server 2>/dev/null || printf 'udp://8.8.8.8')"
 		uci -q get sockroute.main.dns_ref >/dev/null 2>&1 || uci set sockroute.main.dns_ref='dns_standard'
 		uci commit sockroute
 	fi

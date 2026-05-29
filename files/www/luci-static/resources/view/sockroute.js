@@ -133,7 +133,7 @@ function dnsProfilesFromUci() {
 			section: 'standard',
 			ref: 'standard',
 			label: uci.get('sockroute', 'main', 'dns_standard_label') || 'DNS standard',
-			server: uci.get('sockroute', 'main', 'dns_standard_server') || 'udp://100.100.0.217',
+			server: uci.get('sockroute', 'main', 'dns_standard_server') || 'udp://1.1.1.1',
 			lastCheck: 'unknown',
 			lastCheckDetail: '',
 			lastCheckTime: ''
@@ -142,7 +142,7 @@ function dnsProfilesFromUci() {
 			section: 'unblock',
 			ref: 'unblock',
 			label: uci.get('sockroute', 'main', 'dns_unblock_label') || 'DNS unblock',
-			server: uci.get('sockroute', 'main', 'dns_unblock_server') || 'udp://100.100.0.156',
+			server: uci.get('sockroute', 'main', 'dns_unblock_server') || 'udp://8.8.8.8',
 			lastCheck: 'unknown',
 			lastCheckDetail: '',
 			lastCheckTime: ''
@@ -1413,8 +1413,8 @@ function buildStatusSummary(cards) {
 }
 
 function buildDefaultDnsSection(viewObject, defaultDnsServer, dnsProfiles) {
-	var standard = dnsProfileByRef(dnsProfiles, 'standard') || { server: 'udp://100.100.0.217' };
-	var unblock = dnsProfileByRef(dnsProfiles, 'unblock') || { server: 'udp://100.100.0.156' };
+	var standard = dnsProfileByRef(dnsProfiles, 'standard') || { server: 'udp://1.1.1.1' };
+	var unblock = dnsProfileByRef(dnsProfiles, 'unblock') || { server: 'udp://8.8.8.8' };
 
 	return E('div', { 'class': 'cbi-section' }, [
 		E('h3', {}, [ 'DNS профили' ]),
@@ -1430,7 +1430,7 @@ function buildDefaultDnsSection(viewObject, defaultDnsServer, dnsProfiles) {
 					'class': 'cbi-input-text',
 					'style': 'width:100%; max-width:42em;',
 					'value': defaultDnsServer,
-					'placeholder': 'udp://100.100.0.156'
+					'placeholder': 'udp://8.8.8.8'
 				}),
 				' ',
 				E('button', {
@@ -1438,7 +1438,7 @@ function buildDefaultDnsSection(viewObject, defaultDnsServer, dnsProfiles) {
 					'click': ui.createHandlerFn(viewObject, 'handleSaveDefaultDns')
 				}, [ 'Сохранить default DNS' ]),
 				E('div', { 'class': 'cbi-value-description' }, [
-					'Форматы: 100.100.0.156, udp://100.100.0.156, tls://1.1.1.1, https://1.1.1.1/dns-query. LAN DNS используется напрямую.'
+					'Форматы: 8.8.8.8, udp://8.8.8.8, tls://1.1.1.1, https://1.1.1.1/dns-query. LAN DNS используется напрямую.'
 				])
 			])
 		]),
@@ -1451,7 +1451,7 @@ function buildDefaultDnsSection(viewObject, defaultDnsServer, dnsProfiles) {
 					'class': 'cbi-input-text',
 					'style': 'width:100%; max-width:42em;',
 					'value': standard.server,
-					'placeholder': 'udp://100.100.0.217'
+					'placeholder': 'udp://1.1.1.1'
 				})
 			])
 		]),
@@ -1464,7 +1464,7 @@ function buildDefaultDnsSection(viewObject, defaultDnsServer, dnsProfiles) {
 					'class': 'cbi-input-text',
 					'style': 'width:100%; max-width:42em;',
 					'value': unblock.server,
-					'placeholder': 'udp://100.100.0.156'
+					'placeholder': 'udp://8.8.8.8'
 				}),
 				' ',
 				E('button', {
@@ -2353,7 +2353,7 @@ return view.extend({
 		var dnsServer = dnsInput ? dnsInput.value.trim() : '';
 
 		if (!validateDnsServerSpec(dnsServer)) {
-			ui.addNotification(null, E('p', 'Неверный default DNS. Форматы: 100.100.0.156, udp://100.100.0.156, tls://1.1.1.1, https://1.1.1.1/dns-query.'), 'danger');
+			ui.addNotification(null, E('p', 'Неверный default DNS. Форматы: 8.8.8.8, udp://8.8.8.8, tls://1.1.1.1, https://1.1.1.1/dns-query.'), 'danger');
 			return Promise.resolve();
 		}
 
@@ -2436,7 +2436,7 @@ return view.extend({
 								'class': 'cbi-input-text',
 								'style': 'width:100%; max-width:42em;',
 								'value': profile && profile.server || '',
-								'placeholder': 'udp://100.100.0.217'
+								'placeholder': 'udp://1.1.1.1'
 							})
 						])
 					])
